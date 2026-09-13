@@ -1,1 +1,1 @@
-testing
+To run this submission, use this job script: workspaces/christian/SUBMISSION_mitsuba_from_convex_real_intensity/submit_mitsuba_from_convex_coarse_asteroids4to10.sh
