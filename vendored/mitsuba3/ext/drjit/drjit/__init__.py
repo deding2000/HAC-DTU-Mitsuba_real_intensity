@@ -1,0 +1,4734 @@
+from __future__ import annotations
+
+from . import detail
+
+with detail.scoped_rtld_deepbind():
+    try:
+        from . import _drjit_ext as _drjit_ext
+    except ImportError as e:
+        import platform
+        py_ver_pkg = detail._PYTHON_VERSION
+        py_ver_cur = platform.python_version()
+        filename = _drjit_ext.__file__
+
+        err = ImportError(
+            f'Could not import the Dr.Jit binary extension at {filename}. '
+            f'It is likely that the Python version for which Dr.Jit was compiled ({py_ver_pkg}) '
+            f'is incompatible with the current interpreter ({py_ver_cur}), or that a binary dependency is missing.')
+
+        err.__cause__ = e
+        raise err
+
+import sys as _sys
+if _sys.version_info < (3, 11):
+    try:
+        from typing_extensions import overload, Optional, Type, Tuple, List, Sequence, Union, Literal, Callable, TypeVar
+    except ImportError:
+        raise RuntimeError(
+            "Dr.Jit requires the 'typing_extensions' package on Python <3.11")
+else:
+    from typing import overload, Optional, Type, Tuple, List, Sequence, Union, Literal, Callable, TypeVar
+
+from .ast import syntax, hint
+from .interop import wrap
+from . import random
+import builtins as _builtins
+import warnings as _warnings
+
+from functools import wraps
+
+
+def get_cmake_dir() -> str:
+    "Return the path to the Dr.Jit CMake module directory."
+    import os
+    return os.path.join(os.path.abspath(os.path.dirname(__file__)), "cmake", "drjit")
+
+
+# -------------------------------------------------------------------
+#  Predicates and comparison operations for floating point arrays
+# -------------------------------------------------------------------
+
+def isnan(arg, /):
+    """
+    Performs an elementwise test for *NaN* (Not a Number) values
+
+    Args:
+        arg (object): A Dr.Jit array or other kind of numeric sequence type.
+
+    Returns:
+        :py:func:`mask_t(arg) <mask_t>`: A mask value describing the result of the test.
+    """
+    result = arg == arg
+    if isinstance(result, bool):
+        return not result
+    else:
+        return ~result
+
+
+def isinf(arg, /):
+    """
+    Performs an elementwise test for positive or negative infinity
+
+    Args:
+        arg (object): A Dr.Jit array or other kind of numeric sequence type.
+
+    Returns:
+        :py:func:`mask_t(arg) <mask_t>`: A mask value describing the result of the test
+    """
+    return abs(arg) == float('inf')
+
+
+def isfinite(arg, /):
+    """
+    Performs an elementwise test that checks whether values are finite and not
+    equal to *NaN* (Not a Number)
+
+    Args:
+        arg (object): A Dr.Jit array or other kind of numeric sequence type.
+
+    Returns:
+        :py:func:`mask_t(arg) <mask_t>`: A mask value describing the result of the test
+    """
+    return abs(arg) < float('inf')
+
+
+def allclose(
+    a: object,
+    b: object,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    equal_nan: bool = False,
+) -> bool:
+    r'''
+    Returns ``True`` if two arrays are element-wise equal within a given error
+    tolerance.
+
+    The function considers both absolute and relative error thresholds. In particular,
+    **a** and **b** are considered equal if all elements satisfy
+
+    .. math::
+        |a - b| \le |b| \cdot \texttt{rtol} + \texttt{atol}.
+
+    If not specified, the constants ``atol`` and ``rtol`` are chosen depending
+    on the precision of the input arrays:
+
+    .. list-table::
+       :header-rows: 1
+
+       * - Precision
+         - ``rtol``
+         - ``atol``
+       * - ``float64``
+         - ``1e-5``
+         - ``1e-8``
+       * - ``float32``
+         - ``1e-3``
+         - ``1e-5``
+       * - ``float16``
+         - ``1e-1``
+         - ``1e-2``
+
+    Note that these constants used are fairly loose and *far* larger than the
+    roundoff error of the underlying floating point representation. The double
+    precision parameters were chosen to match the behavior of
+    ``numpy.allclose()``.
+
+    Args:
+        a (object): A Dr.Jit array or other kind of numeric sequence type.
+
+        b (object): A Dr.Jit array or other kind of numeric sequence type.
+
+        rtol (float): A relative error threshold chosen according to the above table.
+
+        atol (float): An absolute error threshold according to the above table.
+
+        equal_nan (bool): If **a** and **b** *both* contain a *NaN* (Not a Number) entry,
+                          should they be considered equal? The default is ``False``.
+
+    Returns:
+        bool: The result of the comparison.
+    '''
+
+    if is_array_v(a) or is_array_v(b):
+        # No derivative tracking in the following
+        a, b = detach(a), detach(b)
+
+        if is_special_v(a):
+            a = array_t(a)(a)
+        if is_special_v(b):
+            b = array_t(b)(b)
+
+        # On Metal, avoid float64 promotion by casting to float32
+        if is_array_v(a) and backend_v(a) == JitBackend.Metal:
+            import numpy as np
+            if isinstance(b, np.ndarray) and b.dtype == np.float64:
+                b = b.astype(np.float32)
+        elif is_array_v(b) and backend_v(b) == JitBackend.Metal:
+            import numpy as np
+            if isinstance(a, np.ndarray) and a.dtype == np.float64:
+                a = a.astype(np.float32)
+
+        if is_array_v(a):
+            diff = a - b
+        else:
+            diff = b - a
+
+        a = type(diff)(a)
+        b = type(diff)(b)
+
+        vt = type_v(diff)
+
+        if vt == VarType.Float16:
+            rtol_ref, atol_ref = 1e-2, 1e-2
+        elif vt == VarType.Float32:
+            rtol_ref, atol_ref = 1e-3, 1e-5
+        else:
+            rtol_ref, atol_ref = 1e-5, 1e-8
+
+        atol_c = atol_ref if atol is None else atol
+        rtol_c = rtol_ref if rtol is None else rtol
+
+        cond = abs(diff) <= abs(b) * rtol_c + atol_c
+
+        # plus/minus infinity
+        if is_float_v(a):
+            cond |= a == b
+
+        if equal_nan:
+            cond |= isnan(a) & isnan(b)
+
+        return all(cond, axis=None)
+
+    def safe_len(x):
+        try:
+            return len(x)
+        except TypeError:
+            return 0
+
+    def safe_getitem(x, len_x, i):
+        if len_x == 0:
+            return x
+        elif len_x == 1:
+            return x[0]
+        else:
+            return x[i]
+
+    len_a, len_b = safe_len(a), safe_len(b)
+    len_ab = maximum(len_a, len_b)
+
+    if len_a != len_ab and len_a > 1 or \
+       len_b != len_ab and len_b > 1:
+        raise RuntimeError('drjit.allclose(): incompatible sizes '
+                           '(%i and %i)!' % (len_a, len_b))
+    elif len_ab == 0:
+        if equal_nan and isnan(a) and isnan(b):
+            return True
+
+        rtol_c = 1e-5 if rtol is None else rtol
+        atol_c = 1e-8 if atol is None else atol
+
+        return abs(a - b) <= abs(b) * rtol_c + atol_c
+    else:
+        for i in range(len_ab):
+            ia = safe_getitem(a, len_a, i)
+            ib = safe_getitem(b, len_b, i)
+            if not allclose(ia, ib, rtol, atol, equal_nan):
+                return False
+        return True
+
+
+def assert_allclose(
+    actual: object,
+    desired: object,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    equal_nan: bool = False,
+    err_msg: str = '',
+) -> None:
+    r'''
+    Raise an ``AssertionError`` if two arrays are not element-wise equal within
+    a given error tolerance.
+
+    This is the assertion-raising counterpart of :py:func:`drjit.allclose` and
+    is analogous to ``numpy.testing.assert_allclose``. Elements are considered
+    equal if
+
+    .. math::
+        |\texttt{actual} - \texttt{desired}| \le
+        |\texttt{desired}| \cdot \texttt{rtol} + \texttt{atol}.
+
+    See :py:func:`drjit.allclose` for the default values of ``rtol`` and
+    ``atol`` (they depend on the input precision).
+
+    Unlike ``numpy.testing.assert_allclose``, the happy path stays on device:
+    the only host-visible reduction is a single boolean, and mismatch count /
+    worst-case absolute and relative differences are only read back when the
+    comparison fails.
+
+    Args:
+        actual (object): A Dr.Jit array or other kind of numeric sequence type.
+
+        desired (object): A Dr.Jit array or other kind of numeric sequence type.
+          Its magnitude sets the relative-tolerance scale.
+
+        rtol (float): Relative error threshold. Defaults depend on precision
+          (see :py:func:`drjit.allclose`).
+
+        atol (float): Absolute error threshold. Defaults depend on precision.
+
+        equal_nan (bool): If **actual** and **desired** *both* contain a *NaN*
+          entry at the same position, should they compare equal?
+
+        err_msg (str): Optional prefix prepended to the generated error message.
+
+    Raises:
+        AssertionError: If the arrays are not equal within the given tolerance.
+    '''
+
+    if is_array_v(actual) or is_array_v(desired):
+        a, b = detach(actual), detach(desired)
+
+        if is_special_v(a):
+            a = array_t(a)(a)
+        if is_special_v(b):
+            b = array_t(b)(b)
+
+        if is_array_v(a):
+            diff = a - b
+        else:
+            diff = b - a
+
+        a = type(diff)(a)
+        b = type(diff)(b)
+
+        vt = type_v(diff)
+
+        if vt == VarType.Float16:
+            rtol_ref, atol_ref = 1e-2, 1e-2
+        elif vt == VarType.Float32:
+            rtol_ref, atol_ref = 1e-3, 1e-5
+        else:
+            rtol_ref, atol_ref = 1e-5, 1e-8
+
+        atol_c = atol_ref if atol is None else atol
+        rtol_c = rtol_ref if rtol is None else rtol
+
+        abs_diff = abs(diff)
+        cond = abs_diff <= abs(b) * rtol_c + atol_c
+
+        # plus/minus infinity
+        if is_float_v(a):
+            cond |= a == b
+
+        if equal_nan:
+            cond |= isnan(a) & isnan(b)
+
+        if all(cond, axis=None):
+            return
+
+        # Mismatching elements only contribute to the diagnostic reductions.
+        mismatched = ~cond
+        sel_abs = select(mismatched, abs_diff, 0)
+        denom = abs(b) + atol_c
+        denom_safe = select(denom > 0, denom, 1)
+        sel_rel = select(mismatched, abs_diff / denom_safe, 0)
+
+        n_mismatch = int(count(mismatched, axis=None).array[0])
+        n_total = width(cond)
+        max_abs = float(max(sel_abs, axis=None).array[0])
+        max_rel = float(max(sel_rel, axis=None).array[0])
+
+        def _labeled(name, arr):
+            label = f' {name}: '
+            return label + repr(arr).replace('\n', '\n' + ' ' * len(label))
+
+        prefix = err_msg + '\n' if err_msg else ''
+        raise AssertionError(
+            f"{prefix}"
+            f"Arrays are not equal to tolerance rtol={rtol_c:g}, atol={atol_c:g}\n"
+            f"Mismatched elements: {n_mismatch} / {n_total} "
+            f"({100.0 * n_mismatch / n_total:.3g}%)\n"
+            f"Max absolute difference: {max_abs:.6g}\n"
+            f"Max relative difference: {max_rel:.6g}\n"
+            f"{_labeled('ACTUAL', a)}\n"
+            f"{_labeled('DESIRED', b)}"
+        )
+
+    if not allclose(actual, desired, rtol, atol, equal_nan):
+        prefix = err_msg + '\n' if err_msg else ''
+        raise AssertionError(
+            f"{prefix}"
+            f"assert_allclose() failed: "
+            f"actual={actual!r}, desired={desired!r}"
+        )
+
+
+# -------------------------------------------------------------------
+#   "Safe" functions that avoid domain errors due to rounding
+# -------------------------------------------------------------------
+
+def safe_sqrt(arg: T, /) -> T:
+    '''
+    Safely evaluate the square root of the provided input avoiding domain errors.
+
+    Negative inputs produce zero-valued output. When differentiated via AD,
+    this function also avoids generating infinite derivatives at ``x=0``.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit floating point type
+
+    Returns:
+        float | drjit.ArrayBase: Square root of the input
+    '''
+    result = sqrt(maximum(arg, 0))
+    if is_diff_v(arg) and grad_enabled(arg):
+        alt = sqrt(maximum(arg, epsilon(arg)))
+        result = replace_grad(result, alt)
+    return result
+
+
+def safe_asin(arg: T, /) -> T:
+    '''
+    Safe wrapper around :py:func:`drjit.asin` that avoids domain errors.
+
+    Input values are clipped to the :math:`(-1, 1)` domain. When differentiated
+    via AD, this function also avoids generating infinite derivatives at the
+    boundaries of the domain.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit floating point type
+
+    Returns:
+        float | drjit.ArrayBase: Arcsine approximation
+    '''
+    result = asin(clip(arg, -1, 1))
+    if is_diff_v(arg) and grad_enabled(arg):
+        alt = asin(clip(arg, -one_minus_epsilon(arg), one_minus_epsilon(arg)))
+        result = replace_grad(result, alt)
+    return result
+
+
+def safe_acos(arg: T, /) -> T:
+    '''
+    Safe wrapper around :py:func:`drjit.acos` that avoids domain errors.
+
+    Input values are clipped to the :math:`(-1, 1)` domain. When differentiated
+    via AD, this function also avoids generating infinite derivatives at the
+    boundaries of the domain.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit floating point type
+
+    Returns:
+        float | drjit.ArrayBase: Arccosine approximation
+    '''
+    result = acos(clip(arg, -1, 1))
+    if is_diff_v(arg) and grad_enabled(arg):
+        alt = acos(clip(arg, -one_minus_epsilon(arg), one_minus_epsilon(arg)))
+        result = replace_grad(result, alt)
+    return result
+
+
+def clip(value, min, max):
+    '''
+    Clip the provided input to the given interval.
+
+    This function is equivalent to
+
+    .. code-block::
+
+        dr.maximum(dr.minimum(value, max), min)
+
+    Args:
+        value (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+        min (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+        max (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+
+    Returns:
+        float | drjit.ArrayBase: Clipped input
+    '''
+    return maximum(minimum(value, max), min)
+
+
+def lerp(a, b, t):
+    r'''
+    Linearly blend between two values.
+
+    This function computes
+
+    .. math::
+
+       \mathrm{lerp}(a, b, t) = (1-t) a + t b
+
+    In other words, it linearly blends between :math:`a` and :math:`b` based on
+    the value :math:`t` that is typically on the interval :math:`[0, 1]`.
+
+    It does so using two fused multiply-additions (:py:func:`drjit.fma`) to
+    improve performance and avoid numerical errors.
+
+    Args:
+        a (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+        b (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+        t (int | float | drjit.ArrayBase): A Python or Dr.Jit type
+
+    Returns:
+        float | drjit.ArrayBase: Interpolated result
+    '''
+
+    return fma(b, t, fma(a, -t, a))
+
+def relative_grad(x: dr.ArrayBase):
+    """
+    Create a factor with primal value ``1`` that injects a *relative*
+    first-order derivative with respect to ``x``.
+
+    For nonzero ``x``, the returned value has the same first-order derivative as
+
+        x / detach(x)
+
+    so gradient contributions depend on the *relative change* ``dx/x`` rather
+    than the absolute scale of ``x``.
+
+    The implementation handles zero-valued inputs gracefully.
+    """
+    grad_source = select(x != 0, x * detach(rcp(x)), 0)
+    return replace_grad(1, grad_source)
+
+
+def inverse(arg, /):
+    _warnings.warn("inverse(x) is deprecated, please use rcp(x)",
+                   DeprecationWarning, stacklevel=2)
+    return rcp(arg)
+
+
+def wrap_ad(*args, **kwargs):
+    _warnings.warn("@wrap_ad is deprecated, please use @wrap",
+                   DeprecationWarning, stacklevel=2)
+    return wrap(*args, **kwargs)
+
+
+def sqr(arg, /):
+    _warnings.warn("sqr() is deprecated, please use square(arg)",
+                  DeprecationWarning, stacklevel=2)
+    return square(arg)
+
+
+def all_nested(arg, /):
+    _warnings.warn("all_nested() is deprecated, please use all(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return all(arg, axis=None)
+
+
+def any_nested(arg, /):
+    _warnings.warn("any_nested() is deprecated, please use any(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return any(arg, axis=None)
+
+
+def sum_nested(arg, /):
+    _warnings.warn("sum_nested() is deprecated, please use sum(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return sum(arg, axis=None)
+
+
+def prod_nested(arg, /):
+    _warnings.warn("prod_nested() is deprecated, please use prod(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return prod(arg, axis=None)
+
+
+def min_nested(arg, /):
+    _warnings.warn("min_nested() is deprecated, please use min(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return min(arg, axis=None)
+
+
+def max_nested(arg, /):
+    _warnings.warn("max_nested() is deprecated, please use max(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return max(arg, axis=None)
+
+
+def none_nested(arg, /):
+    _warnings.warn("none_nested() is deprecated, please use none(arg, axis=None)",
+                  DeprecationWarning, stacklevel=2)
+    return none(arg, axis=None)
+
+
+def clamp(value, min, max, /):
+    _warnings.warn("clamp() is deprecated, please use clip(...)",
+                  DeprecationWarning, stacklevel=2)
+    return clip(value, min, max)
+
+# -------------------------------------------------------------------
+#  Special array operations (matrices, quaternions, complex numbers)
+# -------------------------------------------------------------------
+
+def arg(z, /):
+    r'''
+    Return the argument of a complex Dr.Jit array.
+
+    The *argument* refers to the angle (in radians) between the positive real
+    axis and a vector towards ``z`` in the complex plane. When the input isn't
+    complex-valued, the function returns :math:`0` or :math:`\pi` depending on
+    the sign of ``z``.
+
+    Args:
+        z (int | float | complex | drjit.ArrayBase): A Python or Dr.Jit array
+
+    Returns:
+        float | drjit.ArrayBase: Argument of the complex input array
+    '''
+    if is_complex_v(z) or isinstance(z, complex):
+        return atan2(z.imag, z.real)
+    else:
+        return select(z >= 0, 0, pi)
+
+def real(arg, /):
+    '''
+    Return the real part of a complex or quaternion-valued input.
+
+    When the input isn't complex- or quaternion-valued, the function returns
+    the input unchanged.
+
+    Args:
+        arg (int | float | complex | drjit.ArrayBase): A Python or Dr.Jit array
+
+    Returns:
+        float | drjit.ArrayBase: Real part of the input array
+    '''
+    if is_complex_v(arg) or isinstance(arg, complex):
+        return arg.real
+    elif is_quaternion_v(arg):
+        return arg[3]
+    else:
+        return arg
+
+
+def imag(arg, /):
+    '''
+    Return the imaginary part of a complex or quaternion-valued input.
+
+    When the input isn't complex- or quaternion-valued, the function returns
+    zero.
+
+    Args:
+        arg (int | float | complex | drjit.ArrayBase): A Python or Dr.Jit array
+
+    Returns:
+        float | drjit.ArrayBase: Imaginary part of the input array
+    '''
+    tp = type(arg)
+    if is_complex_v(tp) or issubclass(tp, complex):
+        return arg.imag
+    elif is_quaternion_v(tp):
+        m = _sys.modules[tp.__module__]
+        Array3f = replace_type_t(m.Array3f, type_v(arg))
+        return Array3f(arg[0], arg[1], arg[2])
+    else:
+        return tp(0)
+
+
+def conj(arg, /):
+    '''
+    Returns the conjugate of the provided complex or quaternion-valued array.
+    For all other types, it returns the input unchanged.
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit 3D array
+
+    Returns:
+        drjit.ArrayBase: Conjugate form of the input
+    '''
+
+    t = type(arg)
+
+    if is_complex_v(t):
+        return t(arg.real, -arg.imag)
+    elif is_quaternion_v(t):
+        return t(-arg.x, -arg.y, -arg.z, arg.w)
+    else:
+        return arg
+
+
+def cross(arg0: ArrayT, arg1: ArrayT, /) -> ArrayT:
+    '''
+    Returns the cross-product of the two input 3D arrays
+
+    Args:
+        arg0 (drjit.ArrayBase): A Dr.Jit 3D array
+        arg1 (drjit.ArrayBase): A Dr.Jit 3D array
+
+    Returns:
+        drjit.ArrayBase: Cross-product of the two input 3D arrays
+    '''
+
+    if size_v(arg0) != 3 or size_v(arg1) != 3:
+        raise Exception("cross(): requires 3D input arrays!")
+
+    return fma(arg0.yzx, arg1.zxy, -arg0.zxy * arg1.yzx)
+
+
+def det(arg, /):
+    '''
+    det(arg, /)
+    Compute the determinant of the provided Dr.Jit matrix.
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+    Returns:
+        drjit.ArrayBase: The determinant value of the input matrix
+    '''
+    if not is_matrix_v(arg):
+        raise Exception("Unsupported target type!")
+
+    size = size_v(arg)
+
+    if size == 1:
+        return arg[0, 0]
+    elif size == 2:
+        return fma(arg[0, 0], arg[1, 1], -arg[0, 1] * arg[1, 0])
+    elif size == 3:
+        return dot(arg[0], cross(arg[1], arg[2]))
+    elif size == 4:
+        row0, row1, row2, row3 = arg
+
+        shuffle = lambda perm, arr: type(arr)(arr[i] for i in perm)
+
+        row1 = shuffle((2, 3, 0, 1), row1)
+        row3 = shuffle((2, 3, 0, 1), row3)
+
+        temp = shuffle((1, 0, 3, 2), row2 * row3)
+        col0 = row1 * temp
+        temp = shuffle((2, 3, 0, 1), temp)
+        col0 = fma(row1, temp, -col0)
+
+        temp = shuffle((1, 0, 3, 2), row1 * row2)
+        col0 = fma(row3, temp, col0)
+        temp = shuffle((2, 3, 0, 1), temp)
+        col0 = fma(-row3, temp, col0)
+
+        row1 = shuffle((2, 3, 0, 1), row1)
+        row2 = shuffle((2, 3, 0, 1), row2)
+        temp = shuffle((1, 0, 3, 2), row1 * row3)
+        col0 = fma(row2, temp, col0)
+        temp = shuffle((2, 3, 0, 1), temp)
+        col0 = fma(-row2, temp, col0)
+
+        return dot(row0, col0)
+    else:
+        raise Exception('Unsupported array size!')
+
+
+def diag(arg, /):
+    '''
+    diag(arg, /)
+    This function either returns the diagonal entries of the provided Dr.Jit
+    matrix, or it constructs a new matrix from the diagonal entries.
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+    Returns:
+        drjit.ArrayBase: The diagonal matrix of the input matrix
+    '''
+    tp = type(arg)
+    if is_matrix_v(tp):
+        result = value_t(arg)()
+        for i in range(len(arg)):
+            result[i] = arg[i, i]
+        return result
+    elif is_array_v(arg):
+        mat_tp = matrix_t(arg)
+        if mat_tp is None:
+            raise Exception('drjit.diag(): unsupported type!')
+        result = zeros(mat_tp, width(arg))
+        for i, v in enumerate(arg):
+            result[i, i] = v
+        return result
+    else:
+        raise Exception('drjit.diag(): unsupported type!')
+
+
+def identity(dtype, size=1):
+    '''
+    Return the identity array of the desired type and size
+
+    This function can create identity instances of various types. In
+    particular, ``dtype`` can be:
+
+    - A Dr.Jit matrix type (like :py:class:`drjit.cuda.Matrix4f`).
+
+    - A Dr.Jit complex type (like :py:class:`drjit.cuda.Quaternion4f`).
+
+    - Any other Dr.Jit array type. In this case this function is equivalent to ``full(dtype, 1, size)``
+
+    - A scalar Python type like ``int``, ``float``, or ``bool``. The ``size``
+      parameter is ignored in this case.
+
+    Args:
+        dtype (type): Desired Dr.Jit array type, Python scalar type, or
+          :ref:`custom data structure <custom-struct>`.
+
+        size (int): Size of the desired array | matrix
+
+    Returns:
+        object: The identity array of type ``dtype`` of size ``size``
+    '''
+    result = zeros(dtype, size)
+    result += dtype(1)
+    return result
+
+
+def trace(arg, /):
+    '''
+    trace(arg, /)
+    Returns the trace of the provided Dr.Jit matrix.
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+    Returns:
+        drjit.value_t(arg): The trace of the input matrix
+    '''
+    if is_matrix_v(arg):
+        accum = arg[0, 0]
+        accum = type(accum)(accum)
+        for i in range(1, len(arg)):
+            accum += arg[i, i]
+        return accum
+    else:
+        raise Exception('drjit.trace(): unsupported input type!')
+
+def frob(a, /):
+    r'''
+    frob(arg, /)
+    Returns the squared Frobenius norm of the provided Dr.Jit matrix.
+
+    The squared Frobenius norm is defined as the sum of the squares of its elements:
+
+    .. math::
+
+        \sum_{i=1}^m \sum_{j=1}^n a_{i j}^2
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+    Returns:
+        drjit.ArrayBase: The squared Frobenius norm of the input matrix
+    '''
+    if not is_matrix_v(a):
+        raise Exception('frob() : unsupported type!')
+
+    result = square(a[0])
+    for i in range(1, size_v(a)):
+        value = a[i]
+        result = fma(value, value, result)
+    return sum(result)
+
+
+def polar_decomp(arg, it=10):
+    '''
+    Returns the polar decomposition of the provided Dr.Jit matrix.
+
+    The polar decomposition separates the matrix into a rotation followed by a
+    scaling along each of its eigen vectors. This decomposition always exists
+    for square matrices.
+
+    The implementation relies on an iterative algorithm, where the number of
+    iterations can be controlled by the argument ``it`` (tradeoff between
+    precision and computational cost).
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+        it (int): Number of iterations to be taken by the algorithm.
+
+    Returns:
+        tuple: A tuple containing the rotation matrix and the scaling matrix resulting from the decomposition.
+    '''
+    if not is_matrix_v(arg):
+        raise Exception('drjit.polar_decomp(): unsupported input type!')
+
+    def func(q,i):
+        qi = rcp(q.T)
+        gamma = sqrt(frob(qi) / frob(q))
+        s1, s2 = gamma * .5, (rcp(gamma) * .5)
+        for j in range(size_v(arg)):
+            q[j] = fma(q[j], s1, qi[j] * s2)
+        i += 1
+        return q, i
+
+    tp = type(arg)
+    m = _sys.modules[tp.__module__]
+
+    q = type(arg)(arg)
+    i = m.UInt32(0)
+    q0, i0 = while_loop(
+        state=(q, i),
+        cond=lambda q, i: i < it,
+        body=func
+    )
+    return q0, q0.T @ arg
+
+
+def transform_decompose(a, it=10):
+    '''
+    transform_decompose(arg, it=10)
+    Performs a polar decomposition of a non-perspective 4x4 homogeneous
+    coordinate matrix and returns a tuple of
+
+    1. A positive definite 3x3 matrix containing an inhomogeneous scaling operation
+    2. A rotation quaternion
+    3. A 3D translation vector
+
+    This representation is helpful when animating keyframe animations.
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit matrix type
+
+        it (int): Number of iterations to be taken by the polar decomposition algorithm.
+
+    Returns:
+        tuple: The tuple containing the scaling matrix, rotation quaternion and 3D translation vector.
+    '''
+    if not is_matrix_v(a):
+        raise Exception('drjit.transform_decompose(): unsupported input type!')
+
+    if a.shape[:2] != (4,4):
+        raise Exception('drjit.transform_decompose(): invalid input shape!')
+
+    m = _sys.modules[a.__module__]
+    Matrix3f = replace_type_t(m.Matrix3f, type_v(a))
+    Array3f  = replace_type_t(m.Array3f, type_v(a))
+
+    m33 = Matrix3f(
+        a[0][0], a[0][1], a[0][2],
+        a[1][0], a[1][1], a[1][2],
+        a[2][0], a[2][1], a[2][2]
+    )
+
+    Q, P = polar_decomp(m33, it)
+
+    sign_q = det(Q)
+    Q = mulsign(Q, sign_q)
+    P = mulsign(P, sign_q)
+
+    return P, matrix_to_quat(Q), Array3f(a[0][3], a[1][3], a[2][3])
+
+
+def transform_compose(s, q, t, /):
+    '''
+    transform_compose(S, Q, T, /)
+    This function composes a 4x4 homogeneous coordinate transformation from the
+    given scale, rotation, and translation. It performs the reverse of
+    :py:func:`transform_decompose`.
+
+    Args:
+        S (drjit.ArrayBase): A Dr.Jit matrix type representing the scaling part
+        Q (drjit.ArrayBase): A Dr.Jit quaternion type representing the rotation part
+        T (drjit.ArrayBase): A 3D Dr.Jit array type representing the translation part
+
+    Returns:
+        drjit.ArrayBase: The Dr.Jit matrix resulting from the composition described above.
+    '''
+    if not is_matrix_v(s) or not is_quaternion_v(q):
+        raise Exception('drjit.transform_compose(): unsupported input type!')
+
+    if s.shape[:2] != (3,3):
+        raise Exception('drjit.transform_compose(): scale has invalid shape!')
+
+    if len(t) != 3:
+        raise Exception('drjit.transform_compose(): translation has invalid shape!')
+
+    m = _sys.modules[s.__module__]
+    Matrix3f = replace_type_t(m.Matrix3f, type_v(s))
+    Matrix4f = replace_type_t(m.Matrix4f, type_v(s))
+
+    m33 = Matrix3f(quat_to_matrix(Matrix3f, q) @ s)
+
+    m44 = Matrix4f(
+        m33[0][0], m33[0][1], m33[0][2], t[0],
+        m33[1][0], m33[1][1], m33[1][2], t[1],
+        m33[2][0], m33[2][1], m33[2][2], t[2],
+        0        , 0        , 0        , 1.0
+    )
+
+    return m44
+
+def zeros_like(arg: T, /) -> T:
+    """
+    Return an array of zeros with the same shape and type as a given array.
+    """
+    return zeros(type(arg), shape(arg))
+
+def ones_like(arg: T, /) -> T:
+    """
+    Return an array of ones with the same shape and type as a given array.
+    """
+    return ones(type(arg), shape(arg))
+
+def empty_like(arg: T, /) -> T:
+    """
+    Return an empty array with the same shape and type as a given array.
+    """
+    return empty(type(arg), shape(arg))
+
+# -------------------------------------------------------------------
+#                      Mathematical constants
+# -------------------------------------------------------------------
+
+e                     = 2.71828182845904523536  # noqa
+log_two               = 0.69314718055994530942  # noqa
+inv_log_two           = 1.44269504088896340736  # noqa
+
+pi                    = 3.14159265358979323846  # noqa
+inv_pi                = 0.31830988618379067154  # noqa
+sqrt_pi               = 1.77245385090551602793  # noqa
+inv_sqrt_pi           = 0.56418958354775628695  # noqa
+
+two_pi                = 6.28318530717958647692  # noqa
+inv_two_pi            = 0.15915494309189533577  # noqa
+sqrt_two_pi           = 2.50662827463100050242  # noqa
+inv_sqrt_two_pi       = 0.39894228040143267794  # noqa
+
+four_pi               = 12.5663706143591729539  # noqa
+inv_four_pi           = 0.07957747154594766788  # noqa
+sqrt_four_pi          = 3.54490770181103205460  # noqa
+inv_sqrt_four_pi      = 0.28209479177387814347  # noqa
+
+sqrt_two              = 1.41421356237309504880  # noqa
+inv_sqrt_two          = 0.70710678118654752440  # noqa
+
+inf                   = float('inf')  # noqa
+nan                   = float('nan')  # noqa
+
+def epsilon(arg, /):
+    '''
+    Returns the machine epsilon.
+
+    The machine epsilon gives an upper bound on the relative approximation
+    error due to rounding in floating point arithmetic.
+
+    Args:
+        arg (object): Dr.Jit array or array type used to choose between
+          an appropriate constant for half, single, or double precision.
+
+    Returns:
+        float: The machine epsilon.
+    '''
+    vt = type_v(arg)
+    if vt == VarType.Float64:
+        return float.fromhex('0x1p-53')
+    elif vt == VarType.Float32:
+        return float.fromhex('0x1p-24')
+    elif vt == VarType.Float16:
+        return float.fromhex('0x1p-11')
+    else:
+        raise TypeError("epsilon(): input is not a Dr.Jit array or array type!")
+
+
+def one_minus_epsilon(arg, /):
+    '''
+    Returns one minus the machine epsilon value.
+
+    Args:
+        arg (object): Dr.Jit array or array type used to choose between
+          an appropriate constant for half, single, or double precision.
+
+    Returns:
+        float: One minus the machine epsilon.
+    '''
+    vt = type_v(arg)
+    if vt == VarType.Float64:
+        return float.fromhex('0x1.fffffffffffffp-1')
+    elif vt == VarType.Float32:
+        return float.fromhex('0x1.fffffep-1')
+    elif vt == VarType.Float16:
+        return float.fromhex('0x1.ffcp-1')
+    else:
+        raise TypeError("one_minus_epsilon(): input is not a Dr.Jit array or array type!")
+
+
+def recip_overflow(arg, /):
+    '''
+    Returns the reciprocal overflow threshold value.
+
+    Any numbers equal to this threshold or a smaller value will overflow to
+    infinity when reciprocated.
+
+    Args:
+        arg (object): Dr.Jit array or array type used to choose between
+          an appropriate constant for half, single, or double precision.
+
+    Returns:
+        float: The reciprocal overflow threshold value.
+    '''
+    vt = type_v(arg)
+    if vt == VarType.Float64:
+        return float.fromhex('0x1p-1024')
+    elif vt == VarType.Float32:
+        return float.fromhex('0x1p-128')
+    elif vt == VarType.Float16:
+        return float.fromhex('0x1p-16')
+    else:
+        raise TypeError("recip_overflow(): input is not a Dr.Jit array or array type!")
+
+
+def smallest(arg, /):
+    '''
+    Returns the smallest representable normalized floating point value.
+
+    Args:
+        arg (object): Dr.Jit array or array type used to choose between
+          an appropriate constant for half, single, or double precision.
+
+    Returns:
+        float: The smallest representable normalized floating point value.
+    '''
+    vt = type_v(arg)
+    if vt == VarType.Float64:
+        return float.fromhex('0x1p-1022')
+    elif vt == VarType.Float32:
+        return float.fromhex('0x1p-126')
+    elif vt == VarType.Float16:
+        return float.fromhex('0x1p-14')
+    else:
+        raise TypeError("smallest(): input is not a Dr.Jit array or array type!")
+
+def largest(arg, /):
+    '''
+    Returns the largest representable finite floating point value for `t`.
+
+    Args:
+        arg (object): Dr.Jit array or array type used to choose between
+          an appropriate constant for half, single, or double precision.
+
+    Returns:
+        float: The largest representable finite floating point value.
+    '''
+    vt = type_v(arg)
+    if vt == VarType.Float64:
+        return float.fromhex('0x1.fffffffffffffp+1023')
+    elif vt == VarType.Float32:
+        return float.fromhex('0x1.fffffep+127')
+    elif vt == VarType.Float16:
+        return float.fromhex('0x1.ffcp+15')
+    else:
+        raise TypeError("largest(): input is not a Dr.Jit array or array type!")
+
+
+# -------------------------------------------------------------------
+#                        Enabling/disabling AD
+# -------------------------------------------------------------------
+
+
+def suspend_grad(*args, when=True):
+    """
+    Python context manager to temporarily disable gradient tracking globally,
+    or for a specific set of variables.
+
+    This context manager can be used as follows to completely disable all
+    gradient tracking. Newly created variables will be detached from Dr.Jit's
+    AD graph.
+
+    .. code-block:: python
+
+       with dr.suspend_grad():
+           # .. code coes here ..
+
+    You may also specify any number of Dr.Jit arrays, tensors, or :ref:`PyTrees
+    <pytrees>`. In this case, the context manager behaves differently by
+    disabling gradient tracking more selectively for the specified variables.
+
+    .. code-block:: python
+
+       with dr.suspend_grad(x):
+           z = x + y  # 'z' will not track any gradients arising from 'x'
+
+    The :py:func:`suspend_grad` and :py:func:`resume_grad` context manager can
+    be arbitrarily nested and suitably update the set of tracked variables.
+
+    A note about the interaction with :py:func:`drjit.enable_grad`: it is legal
+    to register further AD variables within a scope that disables gradient
+    tracking for specific variables.
+
+    .. code-block:: python
+
+       with dr.suspend_grad(x):
+           y = Float(1)
+           dr.enable_grad(y)
+
+           # The following condition holds
+           assert not dr.grad_enabled(x) and \
+                  dr.grad_enabled(y)
+
+    In contrast, a :py:func:`suspend_grad` environment without arguments that
+    completely disables AD does *not* allow further variables to be registered:
+
+    .. code-block:: python
+
+       with dr.suspend_grad():
+           y = Float(1)
+           dr.enable_grad(y) # ignored
+
+           # The following condition holds
+           assert not dr.grad_enabled(x) and \
+                  not dr.grad_enabled(y)
+
+    Args:
+        *args (tuple): Arbitrary list of Dr.Jit arrays, tuples, or :ref:`PyTrees
+          <pytrees>`. Elements of data structures that could not possibly be
+          attached to the AD graph (e.g., Python scalars) are ignored.
+
+        when (bool): Optional keyword argument that can be specified to turn the
+          context manager into a no-op via ``when=False``. The default value is
+          ``when=True``.
+    """
+    if not when:
+        return detail.NullContextManager()
+
+    array_indices = detail.collect_indices(args)
+
+    if len(args) > 0 and len(array_indices) == 0:
+        array_indices.append(0)
+
+    return detail.ADContextManager(detail.ADScope.Suspend, array_indices)
+
+
+def resume_grad(*args, when=True):
+    """
+    Python context manager to temporarily resume gradient tracking globally,
+    or for a specific set of variables.
+
+    This context manager can be used as follows to fully re-enable all
+    gradient tracking following a previous call to
+    :py:func:`drjit.suspend_grad()`. Newly created variables will then again be
+    attached to Dr.Jit's AD graph.
+
+    .. code-block:: python
+
+       with dr.suspend_grad():
+           # ..
+
+           with dr.resume_grad():
+               # In this scope, the effect of the outer context
+               # manager is effectively disabled
+
+    You may also specify any number of Dr.Jit arrays, tensors, or :ref:`PyTrees
+    <pytrees>`. In this case, the context manager behaves differently by
+    enabling gradient tracking more selectively for the specified variables.
+
+    .. code-block::
+
+       with dr.suspend_grad():
+           with dr.resume_grad(x):
+               z = x + y  # 'z' will only track gradients arising from 'x'
+
+    The :py:func:`suspend_grad` and :py:func:`resume_grad` context manager can
+    be arbitrarily nested and suitably update the set of tracked variables.
+
+    Args:
+        *args (tuple): Arbitrary list of Dr.Jit arrays, tuples, or :ref:`PyTrees
+          <pytrees>`. Elements of data structures that could not possibly be
+          attached to the AD graph (e.g., Python scalars) are ignored.
+
+        when (bool): Optional keyword argument that can be specified to turn the
+          context manager into a no-op via ``when=False``. The default value is
+          ``when=True``.
+    """
+    if not when:
+        return detail.NullContextManager()
+
+    array_indices = []
+    array_indices = detail.collect_indices(args)
+
+    if len(args) > 0 and len(array_indices) == 0:
+        array_indices.append(0)
+
+    return detail.ADContextManager(detail.ADScope.Resume, array_indices)
+
+
+def isolate_grad(when=True):
+    """
+    Python context manager to isolate and partition AD traversals into multiple
+    distinct phases.
+
+    Consider a sequence of steps being differentiated in reverse mode, like so:
+
+    .. code-block:: python
+
+       x = ..
+       dr.enable_grad(x)
+
+       y = f(x)
+       z = g(y)
+       dr.backward(z)
+
+    The :py:func:`drjit.backward` call would automatically traverse the AD
+    graph nodes created during the execution of the function ``f()`` and
+    ``g()``.
+
+    However, sometimes this is undesirable and more control is needed. For
+    example, Dr.Jit may be in an execution context (a symbolic loop or call)
+    that temporarily disallows differentiation of the ``f()`` part. The
+    :py:func:`drjit.isolate_grad` context manager addresses this need:
+
+    .. code-block::
+
+       dr.enable_grad(x)
+       y = f(x)
+
+       with dr.isolate_grad():
+           z = g(y)
+           dr.backward(z)
+
+    Any reverse-mode AD traversal of an edge that crosses the isolation
+    boundary is postponed until leaving the scope. This is mathematically
+    equivalent but produces two smaller separate AD graph traversals.
+
+    Dr.Jit operations like symbolic loops and calls internally create such an
+    isolation boundary, hence it is rare that you would need to do so yourself.
+    :py:func:`isolate_grad` is not useful for forward mode AD.
+
+    Args:
+        when (bool): Optional keyword argument that can be specified to turn the
+          context manager into a no-op via ``when=False``. The default value is
+          ``when=True``.
+    """
+    if not when:
+        return detail.NullContextManager()
+
+    return detail.ADContextManager(detail.ADScope.Isolate, [])
+
+
+# -------------------------------------------------------------------
+#      Miscellaneous
+# -------------------------------------------------------------------
+
+def copy(arg: T, /) -> T:
+    """
+    Create a deep copy of a PyTree
+
+    This function recursively traverses PyTrees and replaces Dr.Jit arrays with
+    copies created via the ordinary copy constructor. It also rebuilds tuples,
+    lists, dictionaries, and other :ref:`custom data strutures <custom_types_py>`.
+    """
+
+    return detail.copy(arg)
+
+
+def sign(arg, /):
+    r'''
+    sign(arg, /)
+    Return the element-wise sign of the provided array.
+
+    The function returns
+
+    .. math::
+
+       \mathrm{sign}(\texttt{arg}) = \begin{cases}
+           1&\texttt{arg}>=0,\\
+           -1&\mathrm{otherwise}.
+       \end{cases}
+
+    Args:
+        arg (int | float | drjit.ArrayBase): A Python or Dr.Jit array
+
+    Returns:
+        float | int | drjit.ArrayBase: Sign of the input array
+    '''
+    t = type(arg)
+    return select(arg >= 0, t(1), t(-1))
+
+
+def copysign(arg0, arg1, /):
+    '''
+    Copy the sign of ``arg1`` to ``arg0`` element-wise.
+
+    Args:
+        arg0 (int | float | drjit.ArrayBase): A Python or Dr.Jit array to change the sign of
+        arg1 (int | float | drjit.ArrayBase): A Python or Dr.Jit array to copy the sign from
+
+    Returns:
+        float | int | drjit.ArrayBase: The values of ``arg0`` with the sign of ``arg1``
+    '''
+    arg0_a = abs(arg0)
+    return select(arg1 >= 0, arg0_a, -arg0_a)
+
+
+def mulsign(arg0, arg1, /):
+    '''
+    Multiply ``arg0`` by the sign of ``arg1`` element-wise.
+
+    This function is equivalent to
+
+    .. code-block::
+
+        a * dr.sign(b)
+
+    Args:
+        arg0 (int | float | drjit.ArrayBase): A Python or Dr.Jit array to multiply the sign of
+        arg1 (int | float | drjit.ArrayBase): A Python or Dr.Jit array to take the sign from
+
+    Returns:
+        float | int | drjit.ArrayBase: The values of ``arg0`` multiplied with the sign of ``arg1``
+    '''
+    return select(arg1 >= 0, arg0, -arg0)
+
+
+def hypot(a, b, /):
+    '''
+    Computes :math:`\\sqrt{a^2+b^2}` while avoiding overflow and underflow.
+
+    Args:
+        arg (list | drjit.ArrayBase): A Python or Dr.Jit arithmetic type
+
+    Returns:
+        Hypotenuse value
+    '''
+    a, b = abs(a), abs(b)
+    maxval = maximum(a, b)
+    minval = minimum(a, b)
+    ratio = minval / maxval
+
+    return select(
+        (a < inf) & (b < inf) & (ratio < inf),
+        maxval * sqrt(fma(ratio, ratio, 1)),
+        a + b
+    )
+
+def log2i(arg: T, /) -> T:
+    '''
+    Return the floor of the base-2 logarithm.
+
+    This function evaluates the component-wise floor of the base-2 logarithm of
+    the input scalar, array, or tensor. This function assumes that ``arg`` is
+    either an arbitrary Dr.Jit integer array or a 32 bit-sized scalar integer
+    value.
+
+    The operation overflows when ``arg`` is zero.
+
+    Args:
+        arg (int | drjit.ArrayBase): A Python or Dr.Jit array
+
+    Returns:
+        int | drjit.ArrayBase: number of leading zero bits in the input array
+    '''
+
+    sz = itemsize_v(arg) if is_array_v(arg) else 4
+    return (sz * 8 - 1) - lzcnt(arg)
+
+
+def rad2deg(arg: T, /) -> T:
+    '''
+    Convert angles from radians to degrees.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit floating point type
+
+    Returns:
+        float | drjit.ArrayBase: The equivalent angle in degrees.
+    '''
+    return arg * (180.0 / pi)
+
+
+def deg2rad(arg: T, /) -> T:
+    '''
+    Convert angles from degrees to radians.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit floating point type
+
+    Returns:
+        float | drjit.ArrayBase: The equivalent angle in radians.
+    '''
+    return arg * (pi / 180.0)
+
+def sphdir(theta, phi):
+    '''
+    Spherical coordinate parameterization of the unit sphere
+
+    Args:
+        theta (float | drjit.ArrayBase): Elevation angle in radians, measured
+            from the positive Z axis. Valid range is [0, π].
+
+        phi (float | drjit.ArrayBase): Azimuth angle in radians, measured from
+            the positive X axis in the XY plane. Valid range is [0, 2π].
+
+    Returns:
+        drjit.ArrayBase: A 3D unit direction vector corresponding to the input
+        spherical coordinates. The result is a 3-component array with unit length.
+    '''
+    st, ct = sincos(theta)
+    sp, cp = sincos(phi)
+
+    import sys
+    tp = type(theta)
+    m = sys.modules[tp.__module__]
+    Array3f = replace_type_t(m.Array3f, type_v(theta))
+
+    return Array3f(cp * st, sp * st, ct)
+
+def var(value, axis = ..., mode = None, keepdims: bool = False, ddof: int = 0):
+    '''
+    Compute the variance of the input along the specified axis/axes.
+
+    This is the *population* variance by default. Set ``ddof=1`` to
+    obtain the (Bessel-corrected) *sample* variance, which divides by
+    ``N - 1`` instead of ``N``.
+
+    The implementation uses the standard two-pass algorithm
+
+    .. code-block:: python
+
+       m = dr.mean(value, axis=axis, keepdims=True)
+       dr.sum((value - m) ** 2, axis=axis) / (N - ddof)
+
+    where ``N`` is the number of input elements that contribute to each
+    output element. The two-pass form avoids the catastrophic
+    cancellation of the algebraically-equivalent ``E[X^2] - E[X]^2``
+    expression when the mean is large compared to the variance.
+
+    See :py:func:`dr.reduce() <reduce>` for the meaning of the ``axis``,
+    ``mode``, and ``keepdims`` arguments.
+
+    Args:
+        value (ArrayBase | Iterable | float | int): An input Dr.Jit
+          array, tensor, iterable, or scalar Python type.
+
+        axis (int | tuple[int, ...] | ... | None): The axis/axes along
+          which to reduce. The special argument ``axis=None`` causes a
+          simultaneous reduction over all axes. The default ``axis=...``
+          applies a reduction over all axes for tensor types and
+          index ``0`` otherwise.
+
+        mode (str | None): optional parameter to force an evaluation
+          strategy. Must equal ``"evaluated"``, ``"symbolic"``, or
+          ``None``.
+
+        keepdims (bool): if ``True``, the reduced axes are retained as
+          size-1 dimensions in the output. Defaults to ``False``.
+
+        ddof (int): "delta degrees of freedom"; the divisor used is
+          ``N - ddof``. Defaults to ``0`` (population variance).
+
+    Returns:
+        The variance along the specified axis/axes.
+    '''
+    if not is_array_v(value):
+        items = list(value) if hasattr(value, '__iter__') else [value]
+        m = mean(items)
+        return sum([(x - m) ** 2 for x in items]) / (len(items) - ddof)
+    m = mean(value, axis=axis, mode=mode, keepdims=True)
+    s = sum((value - m) ** 2, axis=axis, mode=mode, keepdims=keepdims)
+    n = prod(shape(value)) // prod(shape(m))
+    return s / (n - ddof)
+
+
+def std(value, axis = ..., mode = None, keepdims: bool = False, ddof: int = 0):
+    '''
+    Compute the standard deviation of the input along the specified
+    axis/axes.
+
+    Equivalent to ``dr.sqrt(dr.var(value, ...))`` -- see
+    :py:func:`dr.var` for details on the algorithm and the meaning of
+    the ``ddof`` parameter, and :py:func:`dr.reduce` for ``axis``,
+    ``mode``, and ``keepdims``.
+
+    Args:
+        value (ArrayBase | Iterable | float | int): An input Dr.Jit
+          array, tensor, iterable, or scalar Python type.
+
+        axis (int | tuple[int, ...] | ... | None): The axis/axes along
+          which to reduce.
+
+        mode (str | None): optional evaluation strategy.
+
+        keepdims (bool): if ``True``, the reduced axes are retained as
+          size-1 dimensions in the output.
+
+        ddof (int): delta degrees of freedom (default ``0``).
+
+    Returns:
+        The standard deviation along the specified axis/axes.
+    '''
+    return sqrt(var(value, axis=axis, mode=mode, keepdims=keepdims, ddof=ddof))
+
+
+def _to_ordinal_32(value):
+    """Convert an array with <=32-bit elements to order-preserving UInt32."""
+    tp = type(value)
+    vt = type_v(tp)
+    UInt32 = uint32_array_t(tp)
+
+    if vt == VarType.Float16:
+        return _to_ordinal_32(float32_array_t(tp)(value))
+    elif vt == VarType.Float32:
+        u = reinterpret_array(UInt32, value)
+        mask = UInt32(0) - (u >> 31)
+        return u ^ (mask | UInt32(0x80000000))
+    elif is_signed_v(tp):
+        bits = itemsize_v(tp) * 8
+        uint_tp = uint_array_t(tp)
+        u = reinterpret_array(uint_tp, value)
+        return UInt32(u ^ (uint_tp(1) << (bits - 1)))
+    else:
+        return UInt32(value)
+
+
+def _to_ordinal_64(value):
+    """Convert an array with 64-bit elements to order-preserving UInt64."""
+    tp = type(value)
+    vt = type_v(tp)
+    UInt64 = uint64_array_t(tp)
+
+    if vt == VarType.Float64:
+        u = reinterpret_array(UInt64, value)
+        mask = UInt64(0) - (u >> 63)
+        return u ^ (mask | UInt64(0x8000000000000000))
+    elif is_signed_v(tp):
+        uint_tp = uint_array_t(tp)
+        u = reinterpret_array(uint_tp, value)
+        return UInt64(u ^ (uint_tp(1) << 63))
+    else:
+        return UInt64(value)
+
+
+def _from_ordinal_32(ordinal, target_tp):
+    """Invert _to_ordinal_32: convert order-preserving UInt32 back to the original type."""
+    vt = type_v(target_tp)
+    UInt32 = type(ordinal)
+
+    if vt == VarType.Float16:
+        f32_tp = float32_array_t(target_tp)
+        return target_tp(_from_ordinal_32(ordinal, f32_tp))
+    elif vt == VarType.Float32:
+        sign = 1 - (ordinal >> 31)
+        mask = UInt32(0) - sign
+        u = ordinal ^ (mask | UInt32(0x80000000))
+        return reinterpret_array(target_tp, u)
+    elif is_signed_v(target_tp):
+        bits = itemsize_v(target_tp) * 8
+        uint_tp = uint_array_t(target_tp)
+        u = uint_tp(ordinal) ^ (uint_tp(1) << (bits - 1))
+        return reinterpret_array(target_tp, u)
+    else:
+        return target_tp(ordinal)
+
+
+def _from_ordinal_64(ordinal, target_tp):
+    """Invert _to_ordinal_64: convert order-preserving UInt64 back to the original type."""
+    vt = type_v(target_tp)
+    UInt64 = type(ordinal)
+
+    if vt == VarType.Float64:
+        sign = 1 - (ordinal >> 63)
+        mask = UInt64(0) - sign
+        u = ordinal ^ (mask | UInt64(0x8000000000000000))
+        return reinterpret_array(target_tp, u)
+    elif is_signed_v(target_tp):
+        uint_tp = uint_array_t(target_tp)
+        u = uint_tp(ordinal) ^ (uint_tp(1) << 63)
+        return reinterpret_array(target_tp, u)
+    else:
+        return target_tp(ordinal)
+
+
+def _argminmax(value, axis, keepdims, find_max):
+    """
+    Shared implementation of argmin/argmax.
+
+    Uses a packed uint64 reduction for types with <=32-bit elements: the
+    value's order-preserving ordinal occupies the upper 32 bits and the
+    element index the lower 32 bits, so a single min reduction yields both
+    the extremal value and the smallest index among ties.
+
+    Falls back to a two-pass approach (reduce, then find matching index)
+    for 64-bit element types that cannot be packed into 64 bits.
+    """
+    is_tens = is_tensor_v(value)
+
+    if is_tens and axis is None:
+        value = ravel(value)
+        is_tens = False
+
+    tp = type(value)
+    arr = value.array if is_tens else value
+    arr_tp = type(arr)
+    UInt32 = uint32_array_t(arr_tp)
+    UInt64 = uint64_array_t(arr_tp)
+    bits = itemsize_v(arr_tp) * 8
+
+    if is_tens:
+        shape = value.shape
+        ndim = len(shape)
+        if axis < 0:
+            axis += ndim
+        stride = prod(shape[axis + 1:])
+        n = prod(shape)
+        idx = (arange(UInt32, n) // stride) % shape[axis]
+    else:
+        n = len(arr)
+        idx = arange(UInt32, n)
+
+    if bits <= 32:
+        ordinal = _to_ordinal_32(arr)
+        if find_max:
+            ordinal = ~ordinal
+        packed = (UInt64(ordinal) << 32) | UInt64(idx)
+
+        if is_tens:
+            TU64 = tensor_t(UInt64)
+            result = min(TU64(packed, shape), axis=axis, keepdims=keepdims)
+            TU32 = tensor_t(UInt32)
+            return TU32(UInt32(result.array & UInt64(0xFFFFFFFF)), result.shape)
+        else:
+            result = min(packed)
+            return UInt32(result & UInt64(0xFFFFFFFF))
+    else:
+        reduce_fn = max if find_max else min
+        if is_tens:
+            m = reduce_fn(value, axis=axis, keepdims=True)
+            m_arr = m.array
+            m_stride = prod(m.shape[axis + 1:])
+            flat_idx = arange(uint32_array_t(type(m_arr)), n)
+            m_idx = (flat_idx // (stride * shape[axis])) * m_stride + \
+                    (flat_idx % stride)
+            m_expanded = gather(type(m_arr), m_arr, m_idx)
+
+            if find_max:
+                is_ext = arr >= m_expanded
+            else:
+                is_ext = arr <= m_expanded
+
+            idx = select(is_ext, idx, UInt32(0xFFFFFFFF))
+            TU32 = tensor_t(UInt32)
+            return min(TU32(idx, shape), axis=axis, keepdims=keepdims)
+        else:
+            m = reduce_fn(arr)
+            if find_max:
+                is_ext = arr >= m
+            else:
+                is_ext = arr <= m
+            idx = select(is_ext, idx, UInt32(0xFFFFFFFF))
+            return min(idx)
+
+
+def argmin(value: ArrayBase, /, axis: Optional[int] = None, keepdims: bool = False) -> ArrayBase:
+    """
+    Return the indices of the minimum values along an axis.
+
+    When ``axis`` is ``None``, the index refers to the flattened input. When
+    ``axis`` is an integer, the reduction operates along that axis and the
+    result has the same number of dimensions as the input (minus one, unless
+    ``keepdims`` is ``True``).
+
+    When multiple elements share the minimum value, the smallest index is
+    returned.
+
+    Args:
+        value: Input array or tensor.
+
+        axis (int | None): Axis along which to operate. ``None`` reduces
+            over all elements.
+
+        keepdims (bool): If ``True``, the reduced axis is retained as a
+            length-one dimension.
+
+    Returns:
+        object: An unsigned 32-bit integer array or tensor containing the
+        indices of the minimum values.
+    """
+    return _argminmax(value, axis, keepdims, find_max=False)
+
+
+def argmax(value: ArrayBase, /, axis: Optional[int] = None, keepdims: bool = False) -> ArrayBase:
+    """
+    Return the indices of the maximum values along an axis.
+
+    When ``axis`` is ``None``, the index refers to the flattened input. When
+    ``axis`` is an integer, the reduction operates along that axis and the
+    result has the same number of dimensions as the input (minus one, unless
+    ``keepdims`` is ``True``).
+
+    When multiple elements share the maximum value, the smallest index is
+    returned.
+
+    Args:
+        value: Input array or tensor.
+
+        axis (int | None): Axis along which to operate. ``None`` reduces
+            over all elements.
+
+        keepdims (bool): If ``True``, the reduced axis is retained as a
+            length-one dimension.
+
+    Returns:
+        object: An unsigned 32-bit integer array or tensor containing the
+        indices of the maximum values.
+    """
+    return _argminmax(value, axis, keepdims, find_max=True)
+
+
+def _radix_sort(arr, block_size, descending, return_indices):
+    """
+    Multi-pass radix sort using block_mkperm.
+
+    Operates on the flat inner array. When block_size < len(arr),
+    independently sorts contiguous groups of block_size elements.
+    """
+    arr_tp = type(arr)
+
+    # Metal demotes Float64 to a Float32 backing variable, sort that directly.
+    if (backend_v(arr_tp) == JitBackend.Metal and
+            type_v(arr_tp) == VarType.Float64):
+        result = _radix_sort(float32_array_t(arr_tp)(arr), block_size,
+                             descending, return_indices)
+        return result if return_indices else arr_tp(result)
+
+    bits = itemsize_v(arr_tp) * 8
+    n = len(arr)
+
+    if n <= 1 or block_size <= 1:
+        if return_indices:
+            UInt32 = uint32_array_t(arr_tp)
+            return arange(UInt32, n)
+        else:
+            return arr_tp(arr)
+
+    if bits <= 32:
+        ordinal = _to_ordinal_32(arr)
+    else:
+        ordinal = _to_ordinal_64(arr)
+
+    if descending:
+        ordinal = ~ordinal
+
+    Ordinal = type(ordinal)
+    ordinal_bits = itemsize_v(Ordinal) * 8
+    UInt32 = uint32_array_t(arr_tp)
+
+    # 11-bit radix (3 passes for 32-bit) is faster on CPU; 8-bit radix
+    # (4 passes) is better on GPU where shared memory is limited.
+    radix_bits = 11 if backend_v(arr_tp) == JitBackend.LLVM else 8
+
+    if return_indices:
+        index = arange(UInt32, n)
+
+    shift = 0
+    bits_remaining = ordinal_bits
+    while bits_remaining > 0:
+        bits_this_pass = min(radix_bits, bits_remaining)
+        bucket_count = 1 << bits_this_pass
+        mask = bucket_count - 1
+
+        digit = UInt32((ordinal >> shift) & Ordinal(mask))
+
+        eval(digit, ordinal)
+        perm = detail.block_mkperm(digit, block_size, bucket_count)
+
+        ordinal = gather(Ordinal, ordinal, perm)
+        if return_indices:
+            index = gather(UInt32, index, perm)
+
+        shift += bits_this_pass
+        bits_remaining -= bits_this_pass
+
+    if return_indices:
+        return index
+    else:
+        if descending:
+            ordinal = ~ordinal
+        if bits <= 32:
+            return _from_ordinal_32(ordinal, arr_tp)
+        else:
+            return _from_ordinal_64(ordinal, arr_tp)
+
+
+def _sort_tensor_prep(value, axis):
+    """Normalize axis and rotate the target axis to the last position."""
+    shape = value.shape
+    ndim = len(shape)
+    if axis < 0:
+        axis += ndim
+    if axis != ndim - 1:
+        value = moveaxis(value, axis, -1)
+    return value, value.shape, axis
+
+
+def sort(value: ArrayT, /, axis: int = -1, descending: bool = False) -> ArrayT:
+    '''
+    Sort the elements of an array or tensor.
+
+    For 1D arrays, returns a sorted copy. For tensors, sorts along the
+    specified axis (default: last axis). The sort is stable: elements with
+    equal values preserve their original relative order.
+
+    Uses a multi-pass radix sort internally (3 passes for 32-bit types on
+    CPU, 4 on GPU).
+
+    Args:
+        value: Input array or tensor.
+
+        axis (int): Axis along which to sort. Only ``-1`` (last axis) and
+            ``0`` are currently supported for tensors.
+
+        descending (bool): If ``True``, sort in descending order.
+
+    Returns:
+        object: A sorted copy of the input with the same type and shape.
+    '''
+    if is_tensor_v(value):
+        value, shape, axis = _sort_tensor_prep(value, axis)
+        result = type(value)(
+            _radix_sort(value.array, shape[-1], descending, return_indices=False), shape)
+        if axis != len(shape) - 1:
+            result = moveaxis(result, -1, axis)
+        return result
+    else:
+        return _radix_sort(value, len(value), descending, return_indices=False)
+
+
+def argsort(value: ArrayBase, /, axis: int = -1, descending: bool = False) -> ArrayBase:
+    '''
+    Return the indices that would sort an array or tensor.
+
+    For 1D arrays, returns index array such that ``dr.gather(type(value),
+    value, result)`` is sorted. For tensors, returns indices along the
+    specified axis.
+
+    The sort is stable: among equal elements, the original index order
+    is preserved.
+
+    Args:
+        value: Input array or tensor.
+
+        axis (int): Axis along which to sort. Only ``-1`` (last axis) and
+            ``0`` are currently supported for tensors.
+
+        descending (bool): If ``True``, sort in descending order.
+
+    Returns:
+        object: An unsigned 32-bit integer array or tensor containing the
+        sorting indices.
+    '''
+    if is_tensor_v(value):
+        value, shape, axis = _sort_tensor_prep(value, axis)
+        UInt32 = uint32_array_t(type(value.array))
+        raw = _radix_sort(value.array, shape[-1], descending, return_indices=True)
+        result = tensor_t(UInt32)(raw % shape[-1], shape)
+        if axis != len(shape) - 1:
+            result = moveaxis(result, -1, axis)
+        return result
+    else:
+        return _radix_sort(value, len(value), descending, return_indices=True)
+
+
+def normalize(arg: T, /) -> T:
+    '''
+    Normalize the input vector so that it has unit length and return the
+    result.
+
+    This operation is equivalent to
+
+    .. code-block:: python
+
+       arg * dr.rsqrt(dr.squared_norm(arg))
+
+    Args:
+        arg (drjit.ArrayBase): A Dr.Jit array type
+
+    Returns:
+        drjit.ArrayBase: Unit-norm version of the input
+    '''
+
+    return arg * rsqrt(squared_norm(arg))
+
+
+def hypot(a, b):
+    '''
+    Computes :math:`\\sqrt{x^2+y^2}` while avoiding overflow and underflow.
+
+    Args:
+        arg (float | drjit.ArrayBase): A Python or Dr.Jit arithmetic type
+
+    Returns:
+        float | drjit.ArrayBase: The computed hypotenuse.
+    '''
+
+    a, b = abs(a), abs(b)
+    maxval = maximum(a, b)
+    minval = minimum(a, b)
+    ratio = minval / maxval
+
+    return select(
+        (a < inf) & (b < inf) & (ratio < inf),
+        maxval * sqrt(fma(ratio, ratio, 1)),
+        a + b
+    )
+
+
+def reverse(value, axis: int = 0):
+    '''
+    Reverses the given Dr.Jit array or Python sequence along the
+    specified axis.
+
+    Args:
+        value (ArrayBase|Sequence): Dr.Jit array or Python sequence type
+
+        axis (int): Axis along which the reversal should be performed. Only
+          ``axis==0`` is supported for now.
+
+    Returns:
+        object: An output of the same type as `value` containing a copy of the
+        reversed array.
+    '''
+    tp = type(value)
+    n = len(value)
+
+    if axis != 0:
+        raise Exception("reverse(): only the axis=0 case is implemented so far!")
+
+    if is_dynamic_v(tp) and depth_v(tp) == 1:
+        return gather(tp, value, n - 1 - arange(uint32_array_t(tp), n))
+    else:
+        result = []
+        for i in range(n):
+            result.append(value[n-1-i])
+        if not isinstance(result, tp):
+            result = tp(result)
+        return result
+
+def sh_eval(d: ArrayBase, order: int) -> list:
+    """
+    Evalute real spherical harmonics basis function up to a specified order.
+
+    The input ``d`` must be a normalized 3D Cartesian coordinate vector. The
+    function returns a list containing all spherical harmonic basis functions
+    evaluated with respect to ``d`` up to the desired order, for a total of
+    ``(order+1)**2`` output values.
+
+    The implementation relies on efficient pre-generated branch-free code with
+    aggressive constant folding and common subexpression elimination. It admits
+    scalar and Jit-compiled input arrays. Evaluation routines are included for
+    orders ``0`` to ``10``. Requesting higher orders triggers a runtime
+    exception.
+
+    This automatically generated code is based on the paper `Efficient
+    Spherical Harmonic Evaluation <http://jcgt.org/published/0002/02/06/>`__,
+    *Journal of Computer Graphics Techniques (JCGT)*, vol. 2, no. 2, 84-90,
+    2013 by `Peter-Pike Sloan <http://www.ppsloan.org/publications/>`__.
+
+    The SciPy equivalent of this function is given by
+
+    .. code-block:: python
+
+       def sh_eval(d, order: int):
+           from scipy.special import sph_harm_y
+           theta, phi = np.arccos(d.z), np.arctan2(d.y, d.x)
+           r = []
+           for l in range(order + 1):
+               for m in range(-l, l + 1):
+                   Y = sph_harm(l, abs(m), theta, phi)
+                   if m > 0:
+                       Y = np.sqrt(2) * Y.real
+                   elif m < 0:
+                       Y = np.sqrt(2) * Y.imag
+                   r.append(Y.real)
+           return r
+
+    The Mathematica equivalent of a specific entry is given by:
+
+    .. code-block:: wolfram
+
+        SphericalHarmonicQ[l_, m_, d_] := Block[{θ, ϕ},
+          θ = ArcCos[d[[3]]];
+          ϕ = ArcTan[d[[1]], d[[2]]];
+          Piecewise[{
+            {SphericalHarmonicY[l, m, θ, ϕ], m == 0},
+            {Sqrt[2] * Re[SphericalHarmonicY[l,  m, θ, ϕ]], m > 0},
+            {Sqrt[2] * Im[SphericalHarmonicY[l, -m, θ, ϕ]], m < 0}
+          }]
+        ]
+    """
+
+    if order < 0 or order > 9:
+        raise RuntimeError("sh_eval(): order must be in [0, 9]")
+    r = [None]*(order+1)*(order + 1)
+    from . import _sh_eval as _sh_eval
+    getattr(_sh_eval, f'sh_eval_{order}')(d, r)
+    return r
+
+
+def meshgrid(*args, indexing='xy') -> tuple: # <- proper type signature in stubs
+    '''
+    Return flattened N-D coordinate arrays from a sequence of 1D coordinate vectors.
+
+    This function constructs flattened coordinate arrays that are convenient
+    for evaluating and plotting functions on a regular grid. An example is
+    shown below:
+
+    .. code-block::
+
+        import drjit as dr
+
+        x, y = dr.meshgrid(
+            dr.arange(dr.llvm.UInt, 4),
+            dr.arange(dr.llvm.UInt, 4)
+        )
+
+        # x = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
+        # y = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+
+    This function carefully reproduces the behavior of ``numpy.meshgrid``
+    except for one major difference: the output coordinates are returned in
+    flattened/raveled form. Like the NumPy version, the ``indexing=='xy'`` case
+    internally reorders the first two elements of ``*args``.
+
+    Args:
+        *args: A sequence of 1D coordinate arrays
+
+        indexing (str): Specifies the indexing convention. Must be either set
+          to ``'xy'`` (the default) or ``'ij'``.
+
+    Returns:
+        tuple: A tuple of flattened coordinate arrays (one per input)
+    '''
+
+    if indexing != "ij" and indexing != "xy":
+        raise Exception("meshgrid(): 'indexing' argument must equal"
+                        " 'ij' or 'xy'!")
+
+    if len(args) == 0:
+        return ()
+    elif len(args) == 1:
+        return args[0]
+
+    t = type(args[0])
+    for v in args:
+        if not is_array_v(v) or depth_v(v) != 1 or type(v) is not t:
+            raise Exception("meshgrid(): consistent 1D dynamic arrays expected!")
+
+    size = prod((len(v) for v in args))
+    index = arange(uint32_array_t(t), size)
+
+    result = []
+
+    # This seems non-symmetric but is necessary to be consistent with NumPy
+    if indexing == "xy":
+        args = (args[1], args[0], *args[2:])
+
+    for v in args:
+        size //= len(v)
+        index_v = index // size
+        index = fma(-index_v, size, index)
+        result.append(gather(t, v, index_v))
+
+    if indexing == "xy":
+        result[0], result[1] = result[1], result[0]
+
+    return tuple(result)
+
+
+def _compute_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+    """Turn a shape tuple into a C-style strides tuple"""
+    val, ndim = 1, len(shape)
+    strides = [0] * ndim
+    for i in reversed(range(ndim)):
+        strides[i] = val
+        val *= shape[i]
+    return tuple(strides)
+
+
+def concat(arr: Sequence[ArrayT], /, axis: Optional[int] = 0) -> ArrayT:
+    """
+    Concatenate a sequence of arrays or tensors along a given axis.
+
+    The inputs must all be of the same type, and they must have the same shape
+    except for the axis being concatenated. Negative ``axis`` values count
+    backwards from the last dimension.
+
+    When ``axis=None``, the function ravels the input arrays or tensors prior
+    to concatenating them.
+    """
+
+    if is_array_v(arr):
+        raise TypeError("Input should be Python sequence of arrays.")
+
+    if len(arr) == 0:
+        raise RuntimeError("At least one input array/tensor is required!")
+    elif len(arr) == 1:
+        return arr[0]
+
+    if axis is None:
+        arr = tuple(ravel(v) for v in arr)
+        axis = 0
+
+    ref = arr[0]
+    ref_tp = type(ref)
+    if not is_jit_v(ref_tp):
+        raise TypeError(f"The input arrays must be JIT-compiled Dr.Jit types (encountered {ref_tp})!")
+
+    ref_shape = ref.shape
+    ref_ndim = len(ref_shape)
+
+    # Examine the 'axis' parameter
+    if axis < 0:
+        axis = len(ref_shape) + axis
+    if axis >= len(ref_shape):
+        raise RuntimeError(f"The value axis={axis} is out of bounds!")
+
+    # Compute output shape and check compatibility
+    axis_size = 0
+    for i, arg in enumerate(arr):
+        arg_tp = type(arg)
+        if arg_tp is not ref_tp:
+            raise TypeError(f"The input arrays must all have the same type (encountered {ref_tp} and {arg_tp})!")
+        if not is_jit_v(arg):
+            raise TypeError(f"The input arrays must be JIT-compiled Dr.Jit types (encountered {arg_tp})!")
+        arg_shape = arg.shape
+        arg_ndim = len(arg_shape)
+
+        if arg_ndim != ref_ndim:
+            raise TypeError(f"The input arrays must all have the same dimension (encountered {ref_ndim} vs {arg_ndim})!")
+
+        for j in range(ref_ndim):
+            aj, rj = arg_shape[j], ref_shape[j]
+            if j == axis:
+                axis_size += aj
+            elif aj != rj:
+                raise TypeError(f"Input array {i} has an incompatible size on axis {j} (encountered {rj} vs {aj})!")
+
+    out_shape = list(ref_shape)
+    out_shape[axis] = axis_size
+
+    result = empty(ref_tp, out_shape)
+    result_array = result.array
+    Index = uint32_array_t(type(result_array))
+
+    out_inner = prod(out_shape[axis:])
+    stride = prod(out_shape[axis + 1:])
+
+    offset = 0
+    for arg in arr:
+        arg_shape = arg.shape
+        arg_size = prod(arg_shape)
+        arg_array = arg.array
+        i = arange(Index, arg_size)
+
+        if axis == 0:
+            index_out = i + offset * stride
+        else:
+            inner = prod(arg_shape[axis:])
+            index_out = (i // inner) * out_inner + \
+                        (offset * stride) + (i % inner)
+
+        offset += arg_shape[axis]
+
+        scatter(
+            target=result_array,
+            index=index_out,
+            value=arg_array,
+            mode=ReduceMode.Permute
+        )
+
+    return result
+
+
+def _validate_tensor_sequence(arrays, name: str):
+    if is_array_v(arrays):
+        raise TypeError(f"drjit.{name}(): input should be a Python sequence of tensors, not a single array.")
+    if len(arrays) == 0:
+        raise RuntimeError(f"drjit.{name}(): at least one input tensor is required!")
+    ref_tp = type(arrays[0])
+    if not is_tensor_v(ref_tp):
+        raise TypeError(f"drjit.{name}(): expected tensor inputs (got {ref_tp.__module__}.{ref_tp.__qualname__}).")
+    for i, a in enumerate(arrays):
+        if type(a) is not ref_tp:
+            raise TypeError(f"drjit.{name}(): all inputs must have the same type "
+                            f"(input 0 has type {ref_tp.__module__}.{ref_tp.__qualname__}, "
+                            f"input {i} has type {type(a).__module__}.{type(a).__qualname__}).")
+
+
+def expand_dims(value: ArrayT, /, axis: Union[int, Tuple[int, ...]]) -> ArrayT:
+    """
+    Expand the shape of a tensor by inserting new length-one axes.
+
+    The ``axis`` parameter specifies where new axes are placed in the output
+    shape. For example, given a tensor of shape ``(3, 4)``:
+
+    - ``axis=0`` produces shape ``(1, 3, 4)``
+    - ``axis=1`` produces shape ``(3, 1, 4)``
+    - ``axis=-1`` produces shape ``(3, 4, 1)``
+
+    When ``axis`` is a tuple, multiple axes are inserted simultaneously. The
+    axis positions refer to the output shape, and negative values count
+    backwards from the last output dimension.
+
+    This operation does not copy data; it returns a view of the input with a
+    different shape.
+
+    Args:
+        value: Input tensor.
+
+        axis (int | tuple[int, ...]): Position(s) in the output shape where
+            new length-one axes should be inserted.
+
+    Returns:
+        object: A tensor with the same underlying data and one or more
+        additional length-one dimensions.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.expand_dims(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    shape = value.shape
+    ndim = len(shape)
+
+    if isinstance(axis, int):
+        axis = (axis,)
+
+    out_ndim = ndim + len(axis)
+
+    normalized = []
+    for a in axis:
+        if a < 0:
+            a += out_ndim
+        if a < 0 or a >= out_ndim:
+            raise RuntimeError(
+                f"drjit.expand_dims(): axis {a} is out of bounds "
+                f"for a {out_ndim}-dimensional output.")
+        normalized.append(a)
+
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("drjit.expand_dims(): duplicate axes are not allowed.")
+
+    new_shape = list(shape)
+    for a in sorted(normalized):
+        new_shape.insert(a, 1)
+
+    return reshape(type(value), value, new_shape)
+
+
+def stack(arrays: Sequence[ArrayT], /, axis: int = 0) -> ArrayT:
+    """
+    Join a sequence of tensors along a new axis.
+
+    All input tensors must have the same type and shape. The result has one
+    more dimension than the inputs: a new axis of size ``len(arrays)`` is
+    inserted at position ``axis``.
+
+    For example, stacking two tensors of shape ``(M, N)`` with ``axis=0``
+    produces shape ``(2, M, N)``, while ``axis=1`` produces ``(M, 2, N)``.
+
+    Unlike :py:func:`concat`, which joins arrays along an *existing* axis,
+    ``stack`` always creates a *new* one.
+
+    Args:
+        arrays: Sequence of tensors. All must have the same type and shape.
+
+        axis (int): The position of the new axis in the result. Negative
+            values count backwards from the last dimension.
+
+    Returns:
+        object: A tensor with ``ndim + 1`` dimensions.
+    """
+    _validate_tensor_sequence(arrays, 'stack')
+
+    ref_shape = arrays[0].shape
+    ndim = len(ref_shape)
+
+    for i, a in enumerate(arrays):
+        if a.shape != ref_shape:
+            raise TypeError(
+                f"drjit.stack(): all inputs must have the same shape "
+                f"(input 0 has shape {ref_shape}, "
+                f"input {i} has shape {a.shape}).")
+
+    if axis < 0:
+        axis += ndim + 1
+    if axis < 0 or axis > ndim:
+        raise RuntimeError(
+            f"drjit.stack(): axis {axis} is out of bounds "
+            f"for tensors with {ndim} dimensions.")
+
+    expanded = [expand_dims(a, axis=axis) for a in arrays]
+    return concat(expanded, axis=axis)
+
+
+def vstack(arrays: Sequence[ArrayT], /) -> ArrayT:
+    """
+    Stack tensors vertically (row-wise).
+
+    Concatenates tensors along the first axis. 1D tensors of shape ``(N,)``
+    are first reshaped to ``(1, N)`` so that they become rows. The result is
+    always at least 2D.
+
+    The inputs must have the same shape along all but the first axis.
+
+    ``row_stack`` is an alias for this function.
+
+    Args:
+        arrays: Sequence of tensors to stack.
+
+    Returns:
+        object: A tensor with at least two dimensions formed by vertical
+        concatenation.
+    """
+    _validate_tensor_sequence(arrays, 'vstack')
+    tp = type(arrays[0])
+    fixed = [reshape(tp, a, (1,) + a.shape) if len(a.shape) == 1
+             else a for a in arrays]
+    return concat(fixed, axis=0)
+
+
+row_stack = vstack
+
+
+def hstack(arrays: Sequence[ArrayT], /) -> ArrayT:
+    """
+    Stack tensors horizontally (column-wise).
+
+    For tensors with two or more dimensions, this concatenates along the
+    second axis. For 1D tensors, it concatenates along the first (and only)
+    axis.
+
+    The inputs must have the same shape along all but the concatenation axis.
+
+    Args:
+        arrays: Sequence of tensors to stack.
+
+    Returns:
+        object: A tensor formed by horizontal concatenation.
+    """
+    _validate_tensor_sequence(arrays, 'hstack')
+    if len(arrays[0].shape) == 1:
+        return concat(arrays, axis=0)
+    return concat(arrays, axis=1)
+
+
+def column_stack(arrays: Sequence[ArrayT], /) -> ArrayT:
+    """
+    Stack 1D tensors as columns into a 2D tensor.
+
+    Takes a sequence of 1D tensors and stacks them as columns to produce a
+    2D result. Each 1D tensor of shape ``(N,)`` is first reshaped to
+    ``(N, 1)``, then all inputs are concatenated along axis 1.
+
+    2D (or higher) tensors are concatenated along axis 1 as-is, like
+    :py:func:`hstack`.
+
+    All inputs must have the same first dimension.
+
+    Args:
+        arrays: Sequence of tensors to stack.
+
+    Returns:
+        object: A tensor formed by column-wise concatenation.
+    """
+    _validate_tensor_sequence(arrays, 'column_stack')
+    tp = type(arrays[0])
+    fixed = [reshape(tp, a, a.shape + (1,)) if len(a.shape) == 1
+             else a for a in arrays]
+    return concat(fixed, axis=1)
+
+
+def dstack(arrays: Sequence[ArrayT], /) -> ArrayT:
+    """
+    Stack tensors depth-wise (along the third axis).
+
+    Concatenates tensors along the third axis after reshaping them to at least
+    3D. 1D tensors of shape ``(N,)`` become ``(1, N, 1)`` and 2D tensors of
+    shape ``(M, N)`` become ``(M, N, 1)`` before concatenation. The result is
+    always at least 3D.
+
+    The inputs must have the same shape along all but the third axis.
+
+    Args:
+        arrays: Sequence of tensors to stack.
+
+    Returns:
+        object: A tensor with at least three dimensions formed by depth-wise
+        concatenation.
+    """
+    _validate_tensor_sequence(arrays, 'dstack')
+    tp = type(arrays[0])
+    fixed = []
+    for a in arrays:
+        ndim = len(a.shape)
+        if ndim == 1:
+            a = reshape(tp, a, (1,) + a.shape + (1,))
+        elif ndim == 2:
+            a = reshape(tp, a, a.shape + (1,))
+        fixed.append(a)
+    return concat(fixed, axis=2)
+
+
+def split(value: ArrayT, indices_or_sections: Union[int, Sequence[int]], /,
+          axis: int = 0) -> List[ArrayT]:
+    """
+    Split a tensor into multiple parts along an axis.
+
+    When ``indices_or_sections`` is an integer *N*, the tensor is divided into
+    *N* equal parts along ``axis``. The axis size must be divisible by *N*;
+    use :py:func:`array_split` to allow unequal parts.
+
+    When ``indices_or_sections`` is a sequence of indices ``[i, j, ...]``, the
+    splits occur before those positions along the given axis, producing
+    sections ``[:i]``, ``[i:j]``, ``[j:]``, etc.
+
+    Args:
+        value: Input tensor.
+
+        indices_or_sections (int | Sequence[int]): Either the number of
+            equal-sized sections or a sequence of split points.
+
+        axis (int): The axis along which to split. Negative values count
+            backwards from the last dimension.
+
+    Returns:
+        list: A list of tensors.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.split(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    ndim = len(value.shape)
+    if axis < 0:
+        axis += ndim
+
+    n = value.shape[axis]
+    _slice = _builtins.slice
+
+    if isinstance(indices_or_sections, int):
+        if n % indices_or_sections != 0:
+            raise RuntimeError(
+                f"drjit.split(): tensor of size {n} along axis {axis} "
+                f"cannot be equally split into {indices_or_sections} parts. "
+                f"Use drjit.array_split() for unequal splits.")
+        step = n // indices_or_sections
+        indices = range(0, n, step)
+    else:
+        indices = [0] + list(indices_or_sections)
+
+    result = []
+    for i, start in enumerate(indices):
+        end = indices[i + 1] if i + 1 < len(indices) else n
+        s = [_slice(None)] * ndim
+        s[axis] = _slice(start, end)
+        result.append(value[tuple(s)])
+    return result
+
+
+def array_split(value: ArrayT, sections: int, /,
+                axis: int = 0) -> List[ArrayT]:
+    """
+    Split a tensor into approximately equal parts along an axis.
+
+    Like :py:func:`split`, but allows the axis size to not be evenly
+    divisible by ``sections``. The first ``n % sections`` chunks have one
+    extra element.
+
+    Args:
+        value: Input tensor.
+
+        sections (int): Number of output sections.
+
+        axis (int): The axis along which to split. Negative values count
+            backwards from the last dimension.
+
+    Returns:
+        list: A list of tensors.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.array_split(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    ndim = len(value.shape)
+    if axis < 0:
+        axis += ndim
+
+    n = value.shape[axis]
+    size, extra = divmod(n, sections)
+    indices = []
+    pos = 0
+    for i in range(sections - 1):
+        pos += size + (1 if i < extra else 0)
+        indices.append(pos)
+
+    return split(value, indices, axis=axis)
+
+
+def squeeze(value: ArrayT, /, axis: Union[int, Tuple[int, ...], None] = None) -> ArrayT:
+    """
+    Remove length-one axes from a tensor.
+
+    When ``axis`` is ``None`` (the default), all length-one axes are removed.
+    When ``axis`` is an integer or tuple of integers, only those axes are
+    removed, and an error is raised if any of them does not have length one.
+
+    Negative axis values count backwards from the last dimension.
+
+    This is the inverse of :py:func:`expand_dims`.
+
+    Args:
+        value: Input tensor.
+
+        axis (int | tuple[int, ...] | None): The axis or axes to remove.
+            If ``None``, all length-one axes are removed.
+
+    Returns:
+        object: A tensor with the specified length-one dimensions removed.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.squeeze(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    shape = value.shape
+    ndim = len(shape)
+
+    if axis is None:
+        new_shape = tuple(s for s in shape if s != 1)
+    else:
+        if isinstance(axis, int):
+            axis = (axis,)
+
+        normalized = []
+        for a in axis:
+            if a < 0:
+                a += ndim
+            if a < 0 or a >= ndim:
+                raise RuntimeError(
+                    f"drjit.squeeze(): axis {a} is out of bounds "
+                    f"for a {ndim}-dimensional tensor.")
+            if shape[a] != 1:
+                raise RuntimeError(
+                    f"drjit.squeeze(): axis {a} has size {shape[a]}, "
+                    f"not 1.")
+            normalized.append(a)
+
+        if len(set(normalized)) != len(normalized):
+            raise RuntimeError("drjit.squeeze(): duplicate axes are not allowed.")
+
+        new_shape = tuple(s for i, s in enumerate(shape)
+                          if i not in normalized)
+
+    return reshape(type(value), value, new_shape)
+
+
+class _ResampleOp(CustomOp):
+    """Implementation detail of the function drjit.resample()"""
+    def eval(self, resampler, source, stride):
+        self.resampler, self.stride = resampler, stride
+        return type(source)(resampler.resample_fwd(detach(source, False), stride))
+
+    def forward(self):
+        grad_source = detach(self.grad_in('source'), False)
+        self.set_grad_out(
+            self.resampler.resample_fwd(grad_source, self.stride)
+        )
+
+    def backward(self):
+        grad_out = detach(self.grad_out(), False)
+
+        self.set_grad_in(
+            'source',
+            self.resampler.resample_bwd(grad_out, self.stride)
+        )
+
+_resample_cache = {}
+
+def _get_resampler(key, **kwargs):
+    """Return a cached ``detail.Resampler`` for ``key``, building it on a miss."""
+    resampler = _resample_cache.get(key, None)
+    if resampler is None:
+        resampler = detail.Resampler(**kwargs)
+        _resample_cache[key] = resampler
+    return resampler
+
+def _resample_symbolic(mode, fn_name):
+    """Map the ``mode`` argument to the ``Resampler``'s ``symbolic`` flag."""
+    if mode is None or mode == "evaluated":
+        return False
+    if mode == "symbolic":
+        return True
+    raise RuntimeError(
+        f"drjit.{fn_name}(): 'mode' must be None, 'evaluated', or 'symbolic' "
+        f"(got {mode!r}).")
+
+def resample(
+    source: ArrayT,
+    shape: Sequence[int],
+    filter: Union[Literal["box", "linear", "hamming", "cubic", "lanczos", "gaussian"], Callable[[float], float]] = "cubic",
+    filter_radius: Optional[float] = None,
+    boundary: Literal["zero", "nearest", "wrap", "reflect", "mirror"] = "zero",
+    mode: Optional[Literal["evaluated", "symbolic"]] = None
+) -> ArrayT:
+    """
+    Resample an input array/tensor to increase or decrease its resolution along
+    a set of axes.
+
+    This function up- and/or downsamples a given array or tensor along a
+    specified set of axes. Given an input array (``source``) and target shape
+    (``shape``), it returns a compatible array of the specified configuration.
+    This is implemented using a sequence of successive 1D resampling steps for
+    each mismatched axis.
+
+    Example usage:
+
+    .. code-block:: python
+
+       image: TensorXf = ...  # a RGB image
+       width, height, channels = image.shape
+
+       scaled_image = dr.resample(
+           image,
+           (width // 2, height // 2, channels)
+       )
+
+    Resampling uses a `reconstruction filter
+    <https://en.wikipedia.org/wiki/Reconstruction_filter>`__. The following
+    options are available, where :math:`n` refers to the number of dimensions
+    being resampled:
+
+    - ``"box"``: use nearest-neighbor interpolation/averaging. This is very
+      efficient but generally produces sub-par output that is either pixelated
+      (when upsampling) or aliased (when downsampling).
+
+    - ``"linear"``: use linear ramp / tent filter that uses :math:`2^n`
+      neighbors to reconstruct each output sample when upsampling. Tends to
+      produce relatively blurry results.
+
+    - ``"hamming"``: uses the same number of input samples as ``"linear"`` but
+      better preserves sharpness when downscaling. Do not use for upscaling.
+
+    - ``"cubic"``: use cubic filter kernel that queries :math:`4^n`
+      neighbors to reconstruct each output sample when upsampling. Produces
+      high-quality results. This is the default.
+
+    - ``"lanczos"``: use a windowed Lanczos filter that queries :math:`6^n`
+      neighbors to reconstruct each output sample when upsampling. This is the
+      best filter for smooth signals, but also the costliest. The Lanczos
+      filter is susceptible to ringing when the input array contains
+      discontinuities.
+
+    - ``"gaussian"``: use a Gaussian filter that queries :math:4^n` neighbors
+      to reconstruct each output sample when upsampling. The kernel has a
+      standard deviation of 0.5 and is truncated after 4 standard deviations.
+      This filter is mainly useful when intending to blur a signal.
+
+    - Besides the above choices, it is also possible to specify a custom filter.
+      To do so, use the ``filter`` argument to pass a Python callable with
+      signature ``Callable[[float], float]``. In this case, you must also
+      specify a filter radius via the ``filter_radius`` parameter.
+
+    The implementation was extensively tested against `Image.resize()
+    <https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.Image.resize>`__
+    from the Pillow library and should be a drop-in replacement with added
+    support for JIT tracing / GPU evaluation, differentiability, and
+    compatibility with higher-dimensional tensors.
+
+    The operation is differentiable. Because resampling changes the resolution
+    (the transpose is not a resampling of the same kind), its reverse-mode
+    derivative is evaluated with an atomic scatter-add. (The gather-based
+    transpose path applies only to same-resolution convolutions; see
+    :py:func:`convolve`.)
+
+    .. warning::
+
+       When using ``filter="hamming"``, ``"cubic"``, or ``"lanczos"``, the
+       range of the output array can exceed that of the input array. For
+       example, positive-valued data may contain negative values following
+       resampling. Clamp the output in case it is important that array values
+       remain within a fixed range (e.g., :math:`[0,1]`).
+
+    Args:
+        source (dr.ArrayBase): The Dr.Jit tensor or 1D array to be resampled.
+
+        shape (Sequence[int]): The desired output shape.
+
+        filter (str | Callable[[float], float])
+          The desired reconstruction filter, see the above text for an overview.
+          Alternatively, a custom reconstruction filter function can also be
+          specified.
+
+        filter_radius (float | None)
+          The radius of the pixel filter in the output sample space. Should
+          only be specified when using a custom reconstruction filter.
+
+        boundary (str): Selects how filter taps that reach past the edge of the
+          array are handled. The names match those of ``scipy.ndimage``:
+          ``"zero"`` (the default) pads with zeros and renormalizes the affected
+          weights; ``"nearest"`` clamps to the edge sample; ``"wrap"`` is
+          periodic; ``"reflect"`` reflects with the edge sample duplicated; and
+          ``"mirror"`` reflects without duplicating the edge sample. See
+          :py:func:`convolve` for an illustration of each mode.
+
+        mode (str | None): Selects how the resampling kernel is generated.
+          ``"evaluated"`` (the default, also selected by ``None``) fully unrolls
+          the per-output tap loop and explicitly evaluates the result, which is
+          typically faster. ``"symbolic"`` instead traces a symbolic loop over
+          the taps, producing a smaller kernel with deferred evaluation.
+
+    Returns:
+        drjit.ArrayBase: The resampled output array. Its type matches
+        ``source``, and its shape matches ``shape``.
+    """
+
+    source_shape = source.shape
+    strides = _compute_strides(shape)
+    ndim = len(source_shape)
+    tp = type(source)
+    value = source.array
+    symbolic = _resample_symbolic(mode, "resample")
+
+    if len(shape) != ndim:
+        raise RuntimeError(
+            "drjit.resample(): 'source' and 'shape' must have the same number of axes."
+        )
+
+    for i in reversed(range(ndim)):
+        source_res = source_shape[i]
+        target_res = shape[i]
+
+        if source_res == target_res:
+            continue
+
+        # Cache resampler in case it can be reused
+        key = (source_res, target_res, filter, filter_radius, boundary, symbolic)
+        resampler = _get_resampler(
+            key,
+            source_res=source_res,
+            target_res=target_res,
+            filter=filter,
+            filter_radius=filter_radius,
+            boundary=boundary,
+            symbolic=symbolic)
+
+        value = custom(_ResampleOp,
+            resampler=resampler,
+            source=value,
+            stride=strides[i])
+
+    if is_tensor_v(tp):
+        return tp(value, shape)
+    else:
+        return value
+
+@overload
+def convolve(
+    source: ArrayT,
+    filter: Union[Literal["box", "linear", "hamming", "cubic", "lanczos", "gaussian"], Callable[[float], float]],
+    filter_radius: Optional[float] = None,
+    *,
+    axis: Union[int, Tuple[int, ...], None] = None,
+    boundary: Literal["zero", "nearest", "wrap", "reflect", "mirror"] = "zero",
+    normalize: bool = True,
+    mode: Optional[Literal["evaluated", "symbolic"]] = None
+) -> ArrayT:
+    ...
+
+
+@overload
+def convolve(
+    source: ArrayT,
+    filter: Sequence[float],
+    *,
+    axis: Union[int, Tuple[int, ...], None] = None,
+    boundary: Literal["zero", "nearest", "wrap", "reflect", "mirror"] = "zero",
+    normalize: bool = True,
+    mode: Optional[Literal["evaluated", "symbolic"]] = None
+) -> ArrayT:
+    ...
+
+
+def convolve(
+    source: ArrayT,
+    filter: Union[Literal["box", "linear", "hamming", "cubic", "lanczos", "gaussian"], Callable[[float], float], Sequence[float]],
+    filter_radius: Optional[float] = None,
+    *,
+    axis: Union[int, Tuple[int, ...], None] = None,
+    boundary: Literal["zero", "nearest", "wrap", "reflect", "mirror"] = "zero",
+    normalize: bool = True,
+    mode: Optional[Literal["evaluated", "symbolic"]] = None
+) -> ArrayT:
+    """
+    Convolve one or more axes of an input array/tensor with a 1D filter.
+
+    This function filters one or more axes of a Dr.Jit array or tensor. The
+    filter can either be a *continuous* reconstruction filter (a preset or a
+    callable, sampled at integer offsets) or a *discrete* kernel (a sequence of
+    coefficients). The resolution of the array is left unchanged.
+
+    A typical use of a continuous filter is to blur an image, e.g. by
+    convolving it with a 2D Gaussian:
+
+    .. code-block:: python
+
+       image: TensorXf = ...  # a RGB image
+
+       blurred_image = dr.convolve(
+           image,
+           filter='gaussian',
+           filter_radius=10
+       )
+
+    The set of supported presets and the meaning of ``filter_radius`` for
+    custom continuous filters are identical to :py:func:`resample`, please refer
+    to its documentation for details.
+
+    **Discrete kernels and the relation to** ``numpy.convolve``\\ **.** When
+    ``filter`` is a sequence of numbers, it is interpreted as a discrete
+    convolution kernel that is applied directly. The kernel is flipped and
+    aligned so that the result matches the central part of a full convolution
+    (the alignment of :py:func:`numpy.convolve` with ``mode='same'``). Unlike
+    :py:func:`numpy.convolve`, which returns a longer array, ``dr.convolve``
+    always preserves the input shape. The following two computations therefore
+    agree:
+
+    .. code-block:: python
+
+       import numpy as np
+
+       x = np.array([1, 2, 3, 4, 5], dtype=np.float32)
+       k = np.array([1, 0, -1],      dtype=np.float32)
+
+       ref = np.convolve(x, k, mode='same')
+       out = dr.convolve(dr.scalar.ArrayXf(x), list(k),
+                         boundary='zero', normalize=False)
+
+       assert np.allclose(ref, out.numpy())
+
+    The two arguments that reproduce ``numpy.convolve`` are ``boundary='zero'``
+    (which zero-pads the boundary) and ``normalize=False`` (which applies the
+    raw kernel coefficients). These differ from the defaults, which renormalize
+    the weights so that filtering a signal does not alter its overall magnitude.
+
+    **Boundary handling.** The ``boundary`` argument selects how filter taps
+    that reach past the edge of the array are treated. The names match those of
+    ``scipy.ndimage``. Given an array ``[a b c d]``, the left boundary is
+    extended as follows:
+
+    - ``"zero"``: ``0 0 0 | a b c d`` (taps outside the array contribute zero).
+    - ``"nearest"``: ``a a a | a b c d`` (clamp to the edge sample).
+    - ``"wrap"``: ``b c d | a b c d`` (periodic, with period equal to the array
+      size).
+    - ``"reflect"``: ``c b a | a b c d`` (reflect; the edge sample is
+      duplicated).
+    - ``"mirror"``: ``d c b | a b c d`` (reflect; the edge sample is not
+      duplicated).
+
+    **Normalization.** When ``normalize`` is set, the effective per-output
+    weights are rescaled to sum to one. For the ``"zero"`` boundary this also
+    compensates for taps that fall outside the array, reducing darkening near
+    the edges. Set ``normalize=False`` to apply the raw filter coefficients (as
+    needed to reproduce ``numpy.convolve``).
+
+    **Differentiability.** The operation is differentiable. For the ``"zero"``
+    and ``"wrap"`` boundaries its reverse-mode derivative is the transpose of the
+    convolution, which is itself a convolution and is evaluated as a gather
+    (reusing the forward implementation). For the remaining boundaries the
+    adjoint is evaluated with an atomic scatter-add instead.
+
+    Args:
+        source (dr.ArrayBase): The Dr.Jit tensor or 1D array to be filtered.
+
+        filter (str | Callable[[float], float] | Sequence[float]):
+          Either the name of a filter preset, a custom continuous filter
+          function, or a sequence of discrete kernel coefficients.
+
+        filter_radius (float | None):
+          The radius of the continuous function to be used in the convolution.
+          This must be specified for a custom continuous filter and must be
+          ``None`` for a discrete kernel.
+
+        axis (int | tuple[int, ...] | None): The axis or set of axes along which
+          to convolve. The default argument ``axis=None`` causes all axes to be
+          convolved. Negative values count from the last dimension.
+
+        boundary (str): The boundary handling mode, see the above text for an
+          overview. The default is ``"zero"``.
+
+        normalize (bool): Whether to renormalize the filter weights, see the
+          above text. The default is ``True``.
+
+        mode (str | None): Selects how the convolution kernel is generated.
+          ``"evaluated"`` (the default, also selected by ``None``) fully unrolls
+          the per-output tap loop and explicitly evaluates the result, which is
+          typically faster. ``"symbolic"`` instead traces a symbolic loop over
+          the taps, producing a smaller kernel with deferred evaluation.
+
+    Returns:
+        drjit.ArrayBase: The filtered output array. Its type and shape match
+        ``source``.
+    """
+
+    shape = source.shape
+    strides = _compute_strides(shape)
+    ndim = len(shape)
+    tp = type(source)
+    value = source.array
+
+    symbolic = _resample_symbolic(mode, "convolve")
+
+    if axis is None:
+        axis = tuple(range(ndim))
+    elif isinstance(axis, int):
+        axis = (axis, )
+
+    # A discrete kernel is anything that is neither a preset nor a callable
+    discrete = not (isinstance(filter, str) or callable(filter))
+
+    if discrete:
+        if filter_radius is not None:
+            raise RuntimeError(
+                "drjit.convolve(): 'filter_radius' must be None when using a "
+                "discrete filter kernel.")
+        kernel = [float(v) for v in filter]
+        if len(kernel) == 0:
+            raise RuntimeError("drjit.convolve(): the filter kernel is empty.")
+        # Align the kernel like numpy.convolve(mode='same') (matters for even
+        # kernel sizes; coincides with 'len // 2' for odd sizes)
+        origin = (len(kernel) - 1) // 2
+        kernel_key = tuple(kernel)
+    elif callable(filter) and filter_radius is None:
+        raise RuntimeError(
+            "drjit.convolve(): 'filter_radius' must be specified when using a "
+            "custom (continuous) filter function.")
+
+    for i in axis:
+        if i < 0:
+            i = ndim + i
+        res = shape[i]
+
+        # Cache resampler in case it can be reused
+        if discrete:
+            key = (res, kernel_key, origin, boundary, normalize, symbolic, 'disc')
+            resampler = _get_resampler(
+                key,
+                res=res,
+                kernel=kernel,
+                origin=origin,
+                boundary=boundary,
+                normalize=normalize,
+                flip=True,
+                symbolic=symbolic)
+        else:
+            key = (res, res, filter, filter_radius, boundary, normalize, symbolic, 'conv')
+            resampler = _get_resampler(
+                key,
+                source_res=res,
+                target_res=res,
+                filter=filter,
+                filter_radius=filter_radius,
+                convolve=True,
+                boundary=boundary,
+                normalize=normalize,
+                symbolic=symbolic)
+
+        value = custom(_ResampleOp,
+            resampler=resampler,
+            source=value,
+            stride=strides[i])
+
+    if is_tensor_v(tp):
+        return tp(value, shape)
+    else:
+        return value
+
+
+def _normalize_axis_tuple(t: Union[int, Tuple[int, ...]], ndim: int, name: str) -> List[int]:
+    if isinstance(t, int):
+        t = (t, )
+    axes = []
+    for i in t:
+        if i < 0:
+            i += ndim
+        if i < 0 or i >= ndim:
+            raise RuntimeError(f"'{name}' axis is out of bounds")
+        axes.append(i)
+    if len(set(axes)) != len(axes):
+        raise RuntimeError(f"'{name}' contains repeated axes")
+    return axes
+
+
+def moveaxis(arg: ArrayBase, /, source: Union[int, Tuple[int, ...]], destination: Union[int, Tuple[int, ...]]):
+    """
+    Move one or more axes of an input tensor to another position.
+
+    Dimensions of that are not explicitly moved remain in their original order
+    and appear at the positions not specified in the destination. Negative axis
+    values count backwards from the end.
+    """
+
+    if not is_tensor_v(arg):
+        raise TypeError("drjit.moveaxis(): expects a tensor instance as input!")
+
+    shape_in = arg.shape
+    ndim = len(shape_in)
+    source_l = _normalize_axis_tuple(source, ndim, 'source')
+    destination_l = _normalize_axis_tuple(destination, ndim, 'destination')
+
+    if len(source_l) != len(destination_l):
+        raise ValueError("'source' and 'destination` must have the "
+                         "same number of elements")
+
+    # Determine the final axis order (based on NumPy)
+    order = [n for n in range(ndim) if n not in source_l]
+    for dest, src in sorted(zip(destination_l, source_l)):
+        order.insert(dest, src)
+
+    shape_out = tuple(shape_in[i] for i in order)
+    strides_in = _compute_strides(shape_in)
+    strides_out = _compute_strides(shape_out)
+
+    # Smallest moving range [first_axis, last_axis): outside it
+    # order[i] == i and strides agree, so those coords contribute the
+    # same offset to the input and output flat index.
+    first_axis = ndim
+    last_axis = 0
+    for i, j in enumerate(order):
+        if i != j:
+            if i < first_axis:
+                first_axis = i
+            last_axis = i + 1
+
+    arr = arg.array
+    index_out = arange(uint32_array_t(arr), prod(shape_in))
+    index_in = 0
+
+    if first_axis > 0:
+        head_stride = strides_out[first_axis - 1]
+        residue = index_out % head_stride
+        index_in = index_out - residue
+        index_out = residue
+
+    for i in range(first_axis, last_axis):
+        pos = index_out // strides_out[i]
+        index_out -= pos * strides_out[i]
+        index_in += pos * strides_in[order[i]]
+
+    index_in += index_out
+
+    return type(arg)(gather(type(arr), arr, index_in, mode=ReduceMode.Permute), shape_out)
+
+
+def transpose(value: ArrayT, /, axes: Optional[Tuple[int, ...]] = None) -> ArrayT:
+    """
+    Permute the axes of a tensor.
+
+    When ``axes`` is ``None``, the axis order is reversed (the default). When
+    ``axes`` is a tuple, it must be a permutation of ``(0, 1, ..., ndim-1)``
+    specifying the new axis order.
+
+    For example, given a tensor of shape ``(2, 3, 4)``:
+
+    - ``transpose(a)`` produces shape ``(4, 3, 2)``
+    - ``transpose(a, (2, 0, 1))`` produces shape ``(4, 2, 3)``
+
+    Args:
+        value: Input tensor.
+
+        axes (tuple[int, ...] | None): The desired axis order. If ``None``,
+            reverses all axes.
+
+    Returns:
+        object: A tensor with permuted axes.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.transpose(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    ndim = len(value.shape)
+    if axes is None:
+        axes = tuple(reversed(range(ndim)))
+    else:
+        axes = tuple(axes)
+        if len(axes) != ndim:
+            raise RuntimeError(
+                f"drjit.transpose(): 'axes' must have length {ndim} "
+                f"(got {len(axes)}).")
+        normalized = []
+        for a in axes:
+            if a < 0:
+                a += ndim
+            if a < 0 or a >= ndim:
+                raise RuntimeError(
+                    f"drjit.transpose(): axis {a} is out of bounds "
+                    f"for a {ndim}-dimensional tensor.")
+            normalized.append(a)
+        if len(set(normalized)) != len(normalized):
+            raise RuntimeError(
+                "drjit.transpose(): 'axes' must be a permutation "
+                f"of (0, 1, ..., {ndim - 1}).")
+        axes = tuple(normalized)
+
+    return moveaxis(value, axes, tuple(range(ndim)))
+
+
+def swapaxes(value: ArrayT, /, axis1: int, axis2: int) -> ArrayT:
+    """
+    Swap two axes of a tensor.
+
+    For example, given a tensor of shape ``(2, 3, 4)``:
+
+    - ``swapaxes(a, 0, 2)`` produces shape ``(4, 3, 2)``
+    - ``swapaxes(a, 0, 1)`` produces shape ``(3, 2, 4)``
+
+    Negative axis values count backwards from the last dimension.
+
+    Args:
+        value: Input tensor.
+
+        axis1 (int): First axis.
+
+        axis2 (int): Second axis.
+
+    Returns:
+        object: A tensor with the two axes exchanged.
+    """
+    if not is_tensor_v(value):
+        raise TypeError(
+            f"drjit.swapaxes(): expected a tensor input "
+            f"(got {type(value).__module__}.{type(value).__qualname__}).")
+
+    return moveaxis(value, (axis1, axis2), (axis2, axis1))
+
+
+def take(value: ArrayT, index: Union[int, ArrayBase], axis: int = 0) -> ArrayT:
+    """
+    Select values from a tensor along a specified axis using an index or index array.
+
+    This function evaluates ``value[..., index, ...]`` where ``index`` is
+    applied at position ``axis``. The output tensor has one fewer dimension
+    than the input.
+
+    Args:
+        value (drjit.ArrayBase): Input tensor
+
+        index (Union[int, drjit.ArrayBase]): Integer or 1D integer array.
+
+        axis (int): Axis along which to select values. Negative values count
+            from the end. The default is 0.
+
+    Returns:
+        drjit.ArrayBase: Output tensor with shape equal to the input shape
+        minus the indexed axis dimension. The dtype matches the input tensor.
+    """
+
+    shape = value.shape
+    ndim = len(shape)
+
+    # Handle negative axis
+    if axis < 0:
+        axis += ndim
+
+    if not is_tensor_v(value):
+        raise TypeError("drjit.take(): expects a tensor instance as input!")
+
+    if axis < 0 or axis >= ndim:
+        raise RuntimeError(f"drjit.take(): tensor axis {axis} is out of bounds for tensor with {ndim} dimensions!")
+
+    # Get array types
+    array = value.array if is_tensor_v(value) else value
+    Array = type(array)
+    Index = uint32_array_t(Array)
+
+    # Compute new shape
+    if is_array_v(index) and len(index) > 1:
+        index = Index(index)
+        index_dim = index.shape
+        index_len = index_dim[0]
+    else:
+        index_dim = ()
+        index_len = 1
+
+    new_shape = shape[:axis] + index_dim + shape[axis+1:]
+
+    # Compute total size and stride after the axis
+    total = prod(new_shape) if new_shape else 1
+    stride_after = prod(shape[axis+1:]) if axis < ndim - 1 else 1
+
+    result_idx = arange(Index, total)
+
+    if index_len != 1:
+        selected_index = index[(result_idx // stride_after) % index_len]
+    else:
+        selected_index = Index(index)
+
+    flat_idx = (result_idx % stride_after) + selected_index * stride_after
+
+    # Compute flat index for gathering
+    if axis > 0:
+        full_stride = shape[axis] * stride_after
+        before_axis_idx = result_idx // (stride_after * index_len)
+        flat_idx += before_axis_idx * full_stride
+
+    return type(value)(gather(Array, array, flat_idx), new_shape)
+
+
+def take_interp(value: ArrayT, pos: Union[float, ArrayBase], axis: int = 0) -> ArrayT:
+    """
+    Select and interpolate values from a tensor along a specified axis using
+    fractional indices.
+
+    Similar to :py:func:`drjit.take`, but accepts fractional positions and
+    performs linear interpolation between adjacent values along the specified
+    axis. This is useful for smooth sampling from discrete data.
+
+    Args:
+        value (drjit.ArrayBase): Input tensor
+
+        pos (Union[float, drjit.ArrayBase]): Python ``float`` or 1D float array.
+
+        axis (int): Axis along which to interpolate values. Negative values
+            count from the end. Default is 0.
+
+    Returns:
+        drjit.ArrayBase: Output tensor with shape equal to the input shape
+        minus the indexed axis dimension. Values are linearly interpolated
+        based on the fractional indices. The dtype matches the input tensor.
+    """
+    shape = value.shape
+    ndim = len(shape)
+
+    # Handle negative axis
+    if axis < 0:
+        axis += ndim
+
+    if not is_tensor_v(value):
+        raise TypeError("drjit.take_interp(): expects a tensor instance as input!")
+
+    if axis < 0 or axis >= ndim:
+        raise RuntimeError(f"drjit.take_interp(): tensor axis {axis} is out of bounds for tensor with {ndim} dimensions!")
+
+    if shape[axis] < 2:
+        raise RuntimeError(f"drjit.take_interp(): tensor axis {axis} has size {shape[axis]}, but must have at least 2 elements for interpolation!")
+
+    # Get array types
+    array = value.array if is_tensor_v(value) else value
+    Array = type(array)
+    Index = uint32_array_t(Array)
+    Float = float_array_t(Array)
+
+    index = clip(Index(pos), 0, shape[axis] - 2)
+
+    # Compute new shape
+    if is_array_v(index) and len(index) > 1:
+        index = Index(index)
+        index_dim = index.shape
+        index_len = index_dim[0]
+    else:
+        index_dim = ()
+        index_len = 1
+
+    new_shape = shape[:axis] + index_dim + shape[axis+1:]
+
+    # Compute total size and stride after the axis
+    total = prod(new_shape) if new_shape else 1
+    stride_after = prod(shape[axis+1:]) if axis < ndim - 1 else 1
+
+    result_idx = arange(Index, total)
+
+    if index_len != 1:
+        selected_index = index[(result_idx // stride_after) % index_len]
+    else:
+        selected_index = Index(index)
+
+    flat_idx = (result_idx % stride_after) + selected_index * stride_after
+
+    # Compute interpolation weights
+    w1 = Float(pos) - Float(index)
+    w0 = 1.0 - w1
+
+    # Compute flat index for gathering
+    if axis > 0:
+        full_stride = shape[axis] * stride_after
+        before_axis_idx = result_idx // (stride_after * index_len)
+        flat_idx += before_axis_idx * full_stride
+
+    # Gather adjacent values and interpolate
+    v0 = gather(Array, array, flat_idx)
+    v1 = gather(Array, array, flat_idx + stride_after)
+
+    return type(value)(fma(v0, w0, v1 * w1), new_shape)
+
+
+def _map_arrays(value: T, fn: Callable[[ArrayBase], ArrayBase]) -> T:
+    """
+    Walk a Dr.Jit :ref:`PyTree <pytrees>` and apply ``fn`` at every leaf.
+    Tensors and 1D dynamic Dr.Jit arrays are treated as leaves; nested
+    arrays (e.g., ``Array3f`` containing ``Float``) are entered recursively.
+    """
+    tp = type(value)
+
+    if is_array_v(tp):
+        if is_tensor_v(tp) or (depth_v(tp) == 1 and is_dynamic_v(tp)):
+            return fn(value)
+        return tp([_map_arrays(value[i], fn) for i in range(len(value))])
+
+    if tp is tuple:
+        return tuple(_map_arrays(v, fn) for v in value)
+    if tp is list:
+        return [_map_arrays(v, fn) for v in value]
+    if tp is dict:
+        return {k: _map_arrays(v, fn) for k, v in value.items()}
+
+    struct = getattr(tp, 'DRJIT_STRUCT', None)
+    if type(struct) is dict:
+        out = tp()
+        for k in struct:
+            setattr(out, k, _map_arrays(getattr(value, k), fn))
+        return out
+
+    if hasattr(tp, '__dataclass_fields__'):
+        return tp(**{k: _map_arrays(getattr(value, k), fn)
+                     for k in tp.__dataclass_fields__})
+
+    return value
+
+
+def _gather_remap(arr: 'ArrayBase',
+                  out_shape: Tuple[int, ...],
+                  in_shape: Tuple[int, ...],
+                  axis_remap: Sequence[Optional[Callable]]) -> 'ArrayBase':
+    """
+    Gather from ``arr`` (a row-major tensor of shape ``in_shape``) to
+    produce a flat output describing a row-major tensor of shape
+    ``out_shape``. For every output element, the per-axis output
+    coordinate ``o_i`` is passed through ``axis_remap[i]`` (if given,
+    else identity) — this is where the per-operation logic lives
+    (e.g. ``p % size`` for tile, ``p // repeats`` for repeat). The
+    remapped coordinates are then dotted with the row-major strides of
+    ``in_shape`` to obtain the flat source index; axes with ``in_shape[i]
+    == 1`` are broadcast and contribute nothing.
+    """
+    Array = type(arr)
+    Int = int32_array_t(Array)
+    UInt = uint32_array_t(Array)
+
+    out_size = 1
+    for s in out_shape:
+        out_size *= s
+    if out_size == 0:
+        return Array()
+
+    out_strides = _compute_strides(out_shape)
+    in_strides = _compute_strides(in_shape)
+    rem = arange(UInt, out_size)
+    src_index: Optional['ArrayBase'] = None
+    ndim = len(out_shape)
+    for i in range(ndim):
+        if i < ndim - 1:
+            pos = rem // out_strides[i]
+            rem = fma(pos, UInt(-Int(out_strides[i])), rem)
+        else:
+            pos = rem
+        if axis_remap[i] is not None:
+            pos = axis_remap[i](pos)
+        if in_shape[i] != 1:
+            src_index = pos * in_strides[i] if src_index is None \
+                else fma(pos, in_strides[i], src_index)
+
+    if src_index is None:
+        src_index = zeros(UInt, out_size)
+    return gather(Array, arr, src_index)
+
+
+def _repeat_axis_remap(in_size: int,
+                       repeats: Union[int, 'ArrayBase'],
+                       Index: type) -> Tuple[int, Optional[Callable]]:
+    """
+    Build ``(out_size, remap_fn)`` for :py:func:`drjit.repeat` along one
+    axis. ``remap_fn=None`` denotes the identity.
+    """
+    if isinstance(repeats, int):
+        out_size = in_size * repeats
+        remap_fn = (lambda p: p // repeats) if repeats != 1 else None
+        return out_size, remap_fn
+
+    repeats_arr = Index(repeats)
+    if len(repeats_arr) != in_size:
+        raise RuntimeError(
+            f"drjit.repeat(): 'repeats' array of size "
+            f"{len(repeats_arr)} does not match input size {in_size}.")
+    if in_size == 0:
+        return 0, None
+    cum = cumsum(repeats_arr)
+    out_size = int(cum[in_size - 1])
+    remap_fn = lambda p: binary_search(
+        0, in_size, lambda j: gather(Index, cum, j) <= p)
+    return out_size, remap_fn
+
+
+def _tile_leaf(value: 'ArrayBase', reps: Tuple[int, ...]) -> 'ArrayBase':
+    """Apply ``drjit.tile`` to a single 1D-array or tensor leaf."""
+    is_tensor = is_tensor_v(value)
+    if is_tensor:
+        shape_in, arr = tuple(value.shape), value.array
+    elif len(reps) > 1:
+        # Multi-axis tile on a 1D array → promote to a tensor first.
+        ttp = tensor_t(type(value))
+        if ttp is None:
+            raise TypeError(f"drjit.tile(): cannot derive a tensor type "
+                            f"for input of type {type(value).__name__}.")
+        return _tile_leaf(ttp(value), reps)
+    else:
+        shape_in, arr = (len(value),), value
+
+    n, d = len(shape_in), len(reps)
+    out_ndim = n if n > d else d
+    shape_p = (1,) * (out_ndim - n) + shape_in
+    reps_p = (1,) * (out_ndim - d) + reps
+    out_shape = tuple(s * r for s, r in zip(shape_p, reps_p))
+    if out_shape == shape_in:
+        return value
+
+    # ``p % s`` only where the source has >1 element AND we're widening;
+    # size-1 input axes are handled implicitly by ``_gather_remap``.
+    remap = [(lambda p, s=shape_p[i]: p % s)
+             if shape_p[i] > 1 and reps_p[i] > 1 else None
+             for i in range(out_ndim)]
+    out = _gather_remap(arr, out_shape, shape_p, remap)
+    return type(value)(out, out_shape) if is_tensor else out
+
+
+def _repeat_leaf(value: 'ArrayBase',
+                 repeats: Union[int, 'ArrayBase'],
+                 axis: Optional[int]) -> 'ArrayBase':
+    """Apply ``drjit.repeat`` to a single 1D-array or tensor leaf."""
+    is_tensor = is_tensor_v(value)
+    if is_tensor:
+        if axis is None:  # flatten, repeat, rewrap
+            return type(value)(_repeat_leaf(value.array, repeats, None))
+        shape_in = tuple(value.shape)
+        ndim = len(shape_in)
+        if axis < 0:
+            axis += ndim
+        if not 0 <= axis < ndim:
+            raise RuntimeError(f"drjit.repeat(): axis {axis} is out of "
+                               f"bounds for a tensor of dimension {ndim}.")
+        arr = value.array
+    else:
+        if axis not in (None, 0, -1):
+            raise RuntimeError(f"drjit.repeat(): axis {axis} is out of "
+                               f"bounds for a 1D input.")
+        shape_in, ndim, axis, arr = (len(value),), 1, 0, value
+
+    Index = uint32_array_t(type(arr))
+    out_size, remap_fn = _repeat_axis_remap(shape_in[axis], repeats, Index)
+    if out_size == shape_in[axis] and remap_fn is None:
+        return value  # identity (e.g. ``repeats == 1``)
+
+    out_shape = shape_in[:axis] + (out_size,) + shape_in[axis + 1:]
+    remap: List[Optional[Callable]] = [None] * ndim
+    remap[axis] = remap_fn
+    out = _gather_remap(arr, out_shape, shape_in, remap)
+    return type(value)(out, out_shape) if is_tensor else out
+
+
+def tile(value: T, reps: Union[int, Sequence[int]]) -> T:
+    """
+    Lay out copies of ``value`` in a regular tiled pattern.
+
+    With an integer ``reps``, ``value`` is concatenated with itself
+    ``reps`` times along its trailing dynamic dimension:
+
+    .. code-block:: pycon
+
+       >>> from drjit.cuda import Float
+       >>> dr.tile(Float(1, 2), 3)
+       [1, 2, 1, 2, 1, 2]
+
+    The operation threads through :ref:`PyTrees <pytrees>` and through
+    nested static Dr.Jit arrays, tiling every leaf independently.
+
+    When ``reps`` is a sequence of length ``d``, ``value`` is tiled along
+    ``d`` axes. Let ``n`` be the number of dimensions of ``value``: if
+    ``n < d``, the input is treated as having ``d - n`` extra leading
+    axes of length one; if ``n > d``, ``reps`` is left-padded with ones,
+    leaving the leading input axes untouched. The output then has
+    ``max(n, d)`` axes, and along each one its size is the (broadcast)
+    input size times the matching entry of ``reps``. This multi-axis
+    form requires a Dr.Jit tensor; a 1D dynamic array is automatically
+    promoted to one.
+
+    .. code-block:: pycon
+
+       >>> from drjit.cuda import TensorXf
+       >>> dr.tile(TensorXf([[1, 2], [3, 4]]), (2, 1))
+       [[1, 2], [3, 4], [1, 2], [3, 4]]
+
+    Args:
+        value: A Dr.Jit array, tensor, or :ref:`PyTree <pytrees>`.
+
+        reps (int | Sequence[int]): A non-negative integer or sequence of
+          non-negative integers giving the per-axis repetition counts.
+
+    Returns:
+        The tiled output. With a scalar ``reps`` and a non-tensor input
+        the return type is preserved; otherwise affected leaves become
+        Dr.Jit tensors.
+    """
+    if isinstance(reps, int):
+        reps_t: Tuple[int, ...] = (reps,)
+    else:
+        try:
+            reps_t = tuple(int(r) for r in reps)
+        except (TypeError, ValueError):
+            raise TypeError("drjit.tile(): 'reps' must be an int or a "
+                            "sequence of ints.")
+    if any(r < 0 for r in reps_t):
+        raise ValueError(
+            "drjit.tile(): all entries of 'reps' must be non-negative.")
+
+    return _map_arrays(value, lambda leaf: _tile_leaf(leaf, reps_t))
+
+
+def repeat(value: T,
+           repeats: Union[int, 'ArrayBase'],
+           axis: Optional[int] = None) -> T:
+    """
+    Repeat each element of ``value`` one or more times in place.
+
+    Unlike :py:func:`drjit.tile`, which replicates the *whole* input as a
+    pattern, this function replicates each entry *individually*: the
+    ``i``-th input element produces a contiguous run of identical output
+    entries.
+
+    With an integer ``repeats`` and ``axis=None``, each entry is replicated
+    ``repeats`` times along the trailing dynamic dimension:
+
+    .. code-block:: pycon
+
+       >>> from drjit.cuda import Float
+       >>> dr.repeat(Float(1, 2), 3)
+       [1, 1, 1, 2, 2, 2]
+
+    The operation threads through :ref:`PyTrees <pytrees>` and through
+    nested static Dr.Jit arrays, repeating every leaf independently.
+    For tensor inputs, ``axis`` selects which axis to repeat along;
+    ``axis=None`` first flattens the tensor and returns a 1D result.
+
+    ``repeats`` may also be a 1D integer array of per-element counts. Its
+    length must match the input size along ``axis``, and the output then
+    has size ``sum(repeats)`` along that axis. This form uses a binary
+    search over the prefix sum of ``repeats`` and therefore evaluates
+    that prefix sum eagerly.
+
+    .. code-block:: pycon
+
+       >>> from drjit.cuda import Float, UInt32
+       >>> dr.repeat(Float(10, 20, 30), UInt32(1, 2, 3))
+       [10, 20, 20, 30, 30, 30]
+
+    Args:
+        value: A Dr.Jit array, tensor, or :ref:`PyTree <pytrees>`.
+
+        repeats (int | drjit.ArrayBase): Non-negative integer or 1D
+          integer array of per-element repetition counts.
+
+        axis (int | None): Axis along which to repeat (tensor inputs only).
+          ``None`` flattens the input first.
+
+    Returns:
+        The repeated output. With an integer ``repeats``, ``axis=None``,
+        and a non-tensor input, the return type matches ``value``.
+    """
+    if isinstance(repeats, int) and repeats < 0:
+        raise ValueError("drjit.repeat(): 'repeats' must be non-negative.")
+
+    return _map_arrays(value, lambda leaf: _repeat_leaf(leaf, repeats, axis))
+
+
+def upsample(t, shape=None, scale_factor=None):
+    '''
+    upsample(source, shape=None, scale_factor=None)
+    Up-sample the input tensor or texture according to the provided shape.
+
+    Alternatively to specifying the target shape, a scale factor can be provided.
+
+    The behavior of this function depends on the type of ``source``:
+
+    1. When ``source`` is a Dr.Jit tensor, nearest neighbor up-sampling will use
+    hence the target ``shape`` values must be multiples of the source shape
+    values. When `scale_factor` is used, its values must be integers.
+
+    2. When ``source`` is a Dr.Jit texture type, the up-sampling will be
+    performed according to the filter mode set on the input texture. Target
+    ``shape`` values are not required to be multiples of the source shape values.
+    When `scale_factor` is used, its values must be integers.
+
+    .. warning::
+
+       This function is deprecated and will be removed in a future release.
+       Instead, please use the function :py:func:`drjit.resample()`.
+
+    Args:
+        source (object): A Dr.Jit tensor or texture type.
+
+        shape (list): The target shape (optional)
+
+        scale_factor (list): The scale factor to apply to the current shape (optional)
+
+    Returns:
+        object: the up-sampled tensor or texture object. The type of the output will be the same as the type of the source.
+    '''
+    from collections.abc import Sequence as _Sequence
+
+    _warnings.warn("drjit.upsample() is deprecated, please use drjit.resample() instead.",
+                   DeprecationWarning, stacklevel=2)
+
+    if  not getattr(t, 'IsTexture', False) and not is_tensor_v(t):
+        raise TypeError("upsample(): unsupported input type, expected Jit "
+                        "tensor or texture type!")
+
+    if shape is not None and scale_factor is not None:
+        raise TypeError("upsample(): shape and scale_factor arguments cannot "
+                        "be defined at the same time!")
+
+    if shape is not None:
+        if not isinstance(shape, _Sequence):
+            raise TypeError("upsample(): unsupported shape type, expected a list!")
+
+        if len(shape) > len(t.shape):
+            raise TypeError("upsample(): invalid shape size!")
+
+        shape = list(shape) + list(t.shape[len(shape):])
+
+        scale_factor = []
+        for i, s in enumerate(shape):
+            if type(s) is not int:
+                raise TypeError("upsample(): target shape must contain integer values!")
+
+            if s < t.shape[i]:
+                raise TypeError("upsample(): target shape values must be larger "
+                                "or equal to input shape! (%i vs %i)" % (s, t.shape[i]))
+
+            if is_tensor_v(t):
+                factor = s / float(t.shape[i])
+                if factor != int(factor):
+                    raise TypeError("upsample(): target shape must be multiples of "
+                                    "the input shape! (%i vs %i)" % (s, t.shape[i]))
+    else:
+        if not isinstance(scale_factor, _Sequence):
+            raise TypeError("upsample(): unsupported scale_factor type, expected a list!")
+
+        if len(scale_factor) > len(t.shape):
+            raise TypeError("upsample(): invalid scale_factor size!")
+
+        scale_factor = list(scale_factor)
+        for i in range(len(t.shape) - len(scale_factor)):
+            scale_factor.append(1)
+
+        shape = []
+        for i, factor in enumerate(scale_factor):
+            if type(factor) is not int:
+                raise TypeError("upsample(): scale_factor must contain integer values!")
+
+            if factor < 1:
+                raise TypeError("upsample(): scale_factor values must be greater "
+                                "than 0!")
+
+            shape.append(factor * t.shape[i])
+
+    if getattr(t, 'IsTexture', False):
+        value_type = type(t.value())
+        dim = len(t.shape) - 1
+
+        if t.shape[dim] != shape[dim]:
+            raise TypeError("upsample(): channel counts doesn't match input texture!")
+
+         # Create the query coordinates
+        coords = list(meshgrid(*[
+                linspace(value_type, 0.0, 1.0, shape[i], endpoint=False)
+                for i in range(dim)
+            ],
+            indexing='ij'
+        ))
+
+        # Offset coordinates by half a voxel to hit the center of the new voxels
+        for i in range(dim):
+            coords[i] += 0.5 / shape[i]
+
+        # Reverse coordinates order according to dr.Texture convention
+        coords.reverse()
+
+        # Evaluate the texture at all voxel coordinates with interpolation
+        values = t.eval(coords)
+
+        # Concatenate output values to a flatten buffer
+        channels = len(values)
+        w = width(values[0])
+        index = arange(uint32_array_t(value_type), w)
+        data = zeros(value_type, w * channels)
+        for c in range(channels):
+            scatter(data, values[c], channels * index + c)
+
+        # Create the up-sampled texture
+        texture = type(t)(shape[:-1], channels,
+                          use_accel=t.use_accel(),
+                          filter_mode=t.filter_mode(),
+                          wrap_mode=t.wrap_mode())
+        texture.set_value(data)
+
+        return texture
+    else:
+        dim = len(shape)
+        size = prod(shape[:dim])
+        base = arange(uint32_array_t(type(t.array)), size)
+
+        index = 0
+        stride = 1
+        for i in reversed(range(dim)):
+            ratio = shape[i] // t.shape[i]
+            index += (base // ratio % t.shape[i]) * stride
+            base //= shape[i]
+            stride *= t.shape[i]
+
+        return type(t)(gather(type(t.array), t.array, index), tuple(shape))
+
+
+def rng(seed: Union[ArrayBase, int] = 0, method='philox4x32', symbolic: bool = False) -> random.Generator:
+    '''
+    Return a seeded random number generator.
+
+    This function returns a :py:class:`drjit.random.Generator` object. Note the
+    following:
+
+    - Differently seeded random number generators produce statistically
+      independent streams of random variates.
+
+    - ``seed`` can be a Python `int` or Dr.Jit :py:class:`UInt64
+      <drjit.auto.UInt64>`-typed array. The default value ``0`` is used when no
+      seed is specified, making the generator's behavior deterministic across runs.
+
+    - Only ``method=philox4x32`` is supported at the moment. This returns a
+      generator object wrapping the :py:class:`Philox4x32
+      <drjit.auto.Philox4x32>` counter-based PRNG.
+
+    - When ``symbolic=True`` is specified, the internal sampler state will
+      never be explicitly evaluated. This is useful in cases where you wish
+      to explicitly bake these constants into the generated program. Dr.Jit
+      also detects when the sampler is used in a symbolic code block (e.g.,
+      a symbolic loop) and automaticallky sets this flag in such a case.
+    '''
+
+    if method == 'philox4x32':
+        return random.Philox4x32Generator(seed, symbolic=symbolic)
+    else:
+        raise RuntimeError("Only generator='philox4x32' is currently supported.")
+
+
+def binary_search(start, end, pred):
+    '''
+    Perform a binary search over a range given a predicate ``pred``, which
+    monotonically decreases over this range (i.e. max one ``True`` -> ``False``
+    transition).
+
+    Given a (scalar) ``start`` and ``end`` index of a range, this function
+    evaluates a predicate ``floor(log2(end-start) + 1)`` times with index
+    values on the interval [start, end] (inclusive) to find the first index
+    that no longer satisfies it. Note that the template parameter ``Index`` is
+    automatically inferred from the supplied predicate. Specifically, the
+    predicate takes an index array as input argument. When ``pred`` is ``False``
+    for all entries, the function returns ``start``, and when it is ``True`` for
+    all cases, it returns ``end``.
+
+    The following code example shows a typical use case: ``data`` contains a
+    sorted list of floating point numbers, and the goal is to map floating
+    point entries of ``x`` to the first index ``j`` such that ``data[j] >= threshold``
+    (and all of this of course in parallel for each vector element).
+
+    .. code-block::
+
+        dtype = dr.llvm.Float
+        data = dtype(...)
+        threshold = dtype(...)
+
+        index = dr.binary_search(
+            0, len(data) - 1,
+            lambda index: dr.gather(dtype, data, index) < threshold
+        )
+
+    Args:
+        start (int): Starting index for the search range
+        end (int): Ending index for the search range
+        pred (function): The predicate function to be evaluated
+
+    Returns:
+        Index array resulting from the binary search
+    '''
+    assert isinstance(start, int) and isinstance(end, int)
+
+    iterations = log2i(end - start) + 1 if start < end else 0
+
+    for _ in range(iterations):
+        middle = (start + end) >> 1
+
+        cond = pred(middle)
+        start = select(cond, minimum(middle + 1, end), start)
+        end = select(cond, end, middle)
+
+    return start
+
+# Represents the frozen function passed to the decorator without arguments
+F = TypeVar("F")
+# Represents the frozen function passed to the decorator with arguments
+F2 = TypeVar("F2")
+
+
+@overload
+def freeze(
+    f: None = None,
+    *,
+    state_fn: Optional[Callable],
+    limit: Optional[int] = None,
+    warn_after: int = 10,
+    backend: Optional[JitBackend] = None,
+    auto_opaque: bool = True,
+    enabled: bool = True,
+) -> Callable[[F], F]:
+    ...
+
+
+@overload
+def freeze(
+    f: F,
+    *,
+    state_fn: Optional[Callable] = None,
+    limit: Optional[int] = None,
+    warn_after: int = 10,
+    backend: Optional[JitBackend] = None,
+    auto_opaque: bool = True,
+    enabled: bool = True,
+) -> F:
+    ...
+
+
+def freeze(
+    f: Optional[F] = None,
+    *,
+    state_fn: Optional[Callable] = None,
+    limit: Optional[int] = None,
+    warn_after: int = 10,
+    backend: Optional[JitBackend] = None,
+    auto_opaque: bool = True,
+    enabled: bool = True,
+) -> Union[F, Callable[[F2], F2]]:
+    """
+    Decorator to "freeze" functions, which improves efficiency by removing
+    repeated JIT tracing overheads.
+
+    In general, Dr.Jit traces computation and then compiles and launches kernels
+    containing this trace (see the section on :ref:`evaluation <eval>` for
+    details). While the compilation step can often be skipped via caching, the
+    tracing cost can still be significant especially when repeatedly evaluating
+    complex models, e.g., as part of an optimization loop.
+
+    The :py:func:`@dr.freeze <drjit.freeze>` decorator adresses this problem by
+    altogether removing the need to trace repeatedly. For example, consider the
+    following decorated function:
+
+    .. code-block:: python
+
+       @dr.freeze
+       def f(x, y, z):
+          return ... # Complicated code involving the arguments
+
+    Dr.Jit will trace the first call to the decorated function ``f()``, while
+    collecting additional information regarding the nature of the function's inputs
+    and regarding the CPU/GPU kernel launches representing the body of ``f()``.
+
+    If the function is subsequently called with *compatible* arguments (more on
+    this below), it will immediately launch the previously made CPU/GPU kernels
+    without re-tracing, which can substantially improve performance.
+
+    When :py:func:`@dr.freeze <drjit.freeze>` detects *incompatibilities* (e.g., ``x``
+    having a different type compared to the previous call), it will conservatively
+    re-trace the body and keep track of another potential input configuration.
+
+    Frozen functions support arbitrary :ref:`PyTrees <pytrees>` as function
+    arguments and return values.
+
+    The following may trigger re-tracing:
+
+    - Changes in the **type** of an argument or :ref:`PyTree <pytrees>` element.
+    - Changes in the **length** of a container (``list``, ``tuple``, ``dict``).
+    - Changes of **dictionary keys**  or **field names** of dataclasses.
+    - Changes in the AD status (:py:func:`dr.grad_enabled() <drjit.grad_enabled>`) of a variable.
+    - Changes of (non-PyTree) **Python objects**, as detected by mismatching ``hash()``
+      or ``id()`` if they are not hashable.
+
+    The following more technical conditions also trigger re-tracing:
+
+    - A Dr.Jit variable changes from/to a **scalar** configuration (size ``1``).
+    - The sets of variables of the same size change. In the example above, this
+      would be the case if ``len(x) == len(y)`` in one call, and ``len(x) != len(y)``
+      subsequently.
+    - When Dr.Jit variables reference external memory (e.g. mapped NumPy arrays), the
+      memory can be aligned or unaligned. A re-tracing step is needed when this
+      status changes.
+
+    These all correspond to situations where the generated kernel code may need to
+    change, and the system conservatively re-traces to ensure correctness.
+
+    Frozen functions support arguments with a different variable *width* (see
+    :py:func:`dr.with() <drjit.width>`) without re-tracing, as long as the sets of
+    variables of the same width stay consistent.
+
+    Some constructions are problematic and should be avoided in frozen functions.
+
+    - The function :py:func:`dr.width() <drjit.width>` returns an integer literal
+      that may be merged into the generated code. If the frozen function is later
+      rerun with differently-sized arguments, the executed kernels will still
+      reference the old size. One exception to this rule are constructions like
+      `dr.arange(UInt32, dr.width(a))`, where the result only implicitly depends on
+      the width value.
+
+    When calling a frozen function from within an outer frozen function, the content
+    of the inner function will be executed and recorded by the outer function.
+    No separate recording will be made for the inner function, and its ``n_recordings``
+    count will not change. Calling the inner function separately from outside a
+    frozen function will therefore require re-tracing for the provided inputs.
+
+    **Advanced features**. The :py:func:`@dr.freeze <drjit.freeze>` decorator takes
+    several optional parameters that are helpful in certain situations.
+
+    - **Warning when re-tracing happens too often**: Incompatible arguments trigger
+      re-tracing, which can mask issues where *accidentally* incompatible arguments
+      keep :py:func:`@dr.freeze <drjit.freeze>` from producing the expected
+      performance benefits.
+
+      In such situations, it can be helpful to warn and identify changing
+      parameters by name. This feature is enabled and set to ``10`` by default.
+
+       .. code-block:: pycon
+
+          >>> @dr.freeze(warn_after=1)
+          >>> def f(x):
+          ...     return x
+          ...
+          >>> f(Int(1))
+          >>> f(Float(1))
+          The frozen function has been recorded 2 times, this indicates a problem
+          with how the frozen function is being called. For example, calling it
+          with changing python values such as an index. For more information about
+          which variables changed set the log level to ``LogLevel::Debug``.
+
+    - **Limiting memory usage**. Storing kernels for many possible input
+      configuration requires device memory, which can become problematic. Set the
+      ``limit=`` parameter to enable a LRU cache. This is useful when calls to a
+      function are mostly compatible but require occasional re-tracing.
+
+    Args:
+        limit (Optional[int]): An optional integer specifying the maximum number of
+          stored configurations. Once this limit is reached, incompatible calls
+          requiring re-tracing will cause the last used configuration to be dropped.
+
+        warn_after (int): When the number of re-tracing steps exceeds this value,
+          Dr.Jit will generate a warning that explains which variables changed
+          between calls to the function.
+
+        state_fn (Optional[Callable]): This optional callable can specify additional
+          state to identifies the configuration. ``state_fn`` will be called with
+          the same arguments as that of the decorated function. It should return a
+          traversable object (e.g., a list or tuple) that is conceptually treated
+          as if it was another input of the function.
+
+        backend (Optional[JitBackend]): If no inputs are given when calling the
+          frozen function, the backend used has to be specified using this argument.
+          It must match the backend used for computation within the function.
+
+        auto_opaque (bool): If this flag is set true and only literal values
+          or their size changes between calls to the function, these variables
+          will be marked and made opaque. This reduces the memory usage, traversal
+          overhead, and can improve the performance of generated kernels.
+          If the flag is set to false, all input variables will be made opaque.
+
+        enabled (bool): If this flag is set to false, the function will not be
+          frozen, and the call will be forwarded to the inner function.
+    """
+
+    limit = limit if limit is not None else -1
+    backend = backend if backend is not None else JitBackend.Invalid
+
+    def decorator(f):
+        """
+        Internal decorator, returned in ``dr.freeze`` was used with arguments.
+        """
+        import functools
+        import inspect
+
+        # Capturing closure variables lets the frozen function detect when
+        # nonlocal/global symbols change.
+        _cv = inspect.getclosurevars(f)
+        _global_names = tuple(frozenset(_cv.globals) | frozenset(_cv.unbound))
+        _free_vars = f.__code__.co_freevars
+
+        def capture_closure():
+            g = f.__globals__
+            globals_ = {n: g[n] for n in _global_names if n in g}
+            cells = f.__closure__
+            nonlocals_ = {} if cells is None else {
+                n: c.cell_contents for n, c in zip(_free_vars, cells)
+            }
+            return globals_, nonlocals_
+
+        def inner(input: dict):
+            """
+            This inner function is the one that is actually frozen, and it calls
+            the wrapped function. It receives the input such as args, kwargs and
+            any additional input such as closures or state specified with the ``state``
+            lambda, and makes its traversal possible.
+            """
+            args = input["args"]
+            kwargs = input["kwargs"]
+            return f(*args, **kwargs)
+
+        class FrozenFunction:
+            # If this bool is true, the function will be frozen, otherwise the
+            # call will be forwarded to the inner function.
+            enabled: bool
+
+            def __init__(self, f) -> None:
+                self.f = f
+                self.frozen = detail.FrozenFunction(
+                    inner, limit, warn_after, backend, auto_opaque
+                )
+                self.enabled = enabled
+
+            def __call__(self, *args, **kwargs):
+                if not self.enabled:
+                    return self.f(*args, **kwargs)
+
+                globals_, nonlocals_ = capture_closure()
+                input = {
+                    "globals": globals_,
+                    "nonlocals": nonlocals_,
+                    "args": args,
+                    "kwargs": kwargs,
+                }
+                if state_fn is not None:
+                    input["state_fn"] = state_fn(*args, **kwargs)
+
+                return self.frozen(input)
+
+            @property
+            def n_recordings(self):
+                """
+                Represents the number of times the function was recorded. This
+                includes occasions where it was recorded due to a dry-run failing.
+                It does not necessarily correspond to the number of recordings
+                currently cached see ``n_cached_recordings`` for that.
+                """
+                return self.frozen.n_recordings
+
+            @property
+            def n_cached_recordings(self):
+                """
+                Represents the number of recordings currently cached of the frozen
+                function. If a recording fails in dry-run mode, it will not create
+                a new recording, but replace the recording that was attemted to be
+                replayed. The number of recordings can also be limited with
+                the ``max_cache_size`` argument.
+                """
+                return self.frozen.n_cached_recordings
+
+            def clear(self):
+                """
+                Clears the recordings of the frozen function, and resets the
+                ``n_recordings`` counter. The reference to the function is still
+                kept, and the frozen function can be called again to re-trace
+                new recordings.
+                """
+                return self.frozen.clear()
+
+            def __get__(self, obj, type=None):
+                if obj is None:
+                    return self
+                else:
+                    return FrozenMethod(self.f, self.frozen, obj)
+
+        class FrozenMethod(FrozenFunction):
+            """
+            A FrozenMethod currying the object into the __call__ method.
+
+            If the ``freeze`` decorator is applied to a method of some class, it has
+            to call the internal frozen function with the ``self`` argument. To this
+            end we implement the ``__get__`` method of the frozen function, to
+            return a ``FrozenMethod``, which holds a reference to the object.
+            The ``__call__`` method of the ``FrozenMethod`` then supplies the object
+            in addition to the arguments to the internal function.
+            """
+            def __init__(self, f, frozen, obj) -> None:
+                self.f = f
+                self.obj = obj
+                self.frozen = frozen
+                self.enabled = enabled
+
+            def __call__(self, *args, **kwargs):
+                if not self.enabled:
+                    return self.f(self.obj, *args, **kwargs)
+
+                # self.f is the same function object captured by capture_closure
+                # above (its __globals__/__closure__ are identical).
+                globals_, nonlocals_ = capture_closure()
+                input = {
+                        "globals": globals_,
+                        "nonlocals": nonlocals_,
+                        "args": [self.obj, *args],
+                        "kwargs": kwargs,
+                    }
+                if state_fn is not None:
+                    input["state_fn"] = state_fn(self.obj, *args, **kwargs)
+                return self.frozen(input)
+
+        return functools.wraps(f)(FrozenFunction(f))
+
+    if f is not None:
+        return decorator(f)
+    else:
+        return decorator
+
+
+del F
+del F2
+
+def assert_true(
+    cond,
+    fmt: Optional[str] = None,
+    *args,
+    tb_depth: int = 3,
+    tb_skip: int = 0,
+    **kwargs,
+):
+    """
+    Generate an assertion failure message when any of the entries in ``cond``
+    are ``False``.
+
+    This function resembles the built-in ``assert`` keyword in that it raises
+    an ``AssertionError`` when the condition ``cond`` is ``False``.
+
+    In contrast to the built-in keyword, it also works when ``cond`` is an
+    array of boolean values. In this case, the function raises an exception
+    when *any* entry of ``cond`` is ``False``.
+
+    The function accepts an optional format string along with positional and
+    keyword arguments, and it processes them like :py:func:`drjit.print`. When
+    only a subset of the entries of ``cond`` is ``False``, the function reduces
+    the generated output to only include the associated entries.
+
+    .. code-block:: python
+
+       >>> x = Float(1, -4, -2, 3)
+       >>> dr.assert_true(x >= 0, 'Found negative values: {}', x)
+       Traceback (most recent call last):
+         File "<stdin>", line 1, in <module>
+         File "drjit/__init__.py", line 1327, in assert_true
+           raise AssertionError(msg)
+       AssertionError: Assertion failure: Found negative values: [-4, -2]
+
+    This function also works when some of the function inputs are *symbolic*.
+    In this case, the check is delayed and potential failures will be reported
+    asynchronously. In this case, :py:func:`drjit.assert_true` generates output
+    on ``sys.stderr`` instead of raising an exception, as the original
+    execution context no longer exists at that point.
+
+    Assertion checks carry a performance cost, hence they are disabled by
+    default. To enable them, set the JIT flag :py:attr:`dr.JitFlag.Debug`.
+
+    Args:
+        cond (bool | drjit.ArrayBase): The condition used to trigger the
+          assertion. This should be a scalar Python boolean or a 1D boolean
+          array.
+
+        fmt (str): An optional format string that will be appended to
+          the error message. It can reference positional or keyword
+          arguments specified via ``*args`` and ``**kwargs``.
+
+        *args (tuple): Optional variable-length positional arguments referenced
+          by ``fmt``, see :py:func:`drjit.print` for details on this.
+
+        tb_depth (int): Depth of the backtrace that should be appended to the
+          assertion message. This only applies to cases some of the inputs are
+          symbolic, and printing of the error message must be delayed.
+
+        tb_skip (int): The first ``tb_skip`` entries of the backtrace will be
+          removed. This only applies to cases some of the inputs are symbolic,
+          and printing of the error message must be delayed. This is helpful when
+          the assertion check is called from a helper function that should not be
+          shown.
+
+        **kwargs (dict): Optional variable-length keyword arguments referenced
+          by ``fmt``, see :py:func:`drjit.print` for details on this.
+    """
+
+    if not flag(JitFlag.Debug):
+        return
+    if cond is True or (not detail.any_symbolic(cond) and all(cond)):
+        return
+
+    import traceback, types
+
+    active = not cond if isinstance(cond, bool) else ~cond
+
+    if detail.any_symbolic((active, args, kwargs)):
+        tb_frame = _sys._getframe(tb_skip + 1)
+        tb = types.TracebackType(tb_next=None,
+                                 tb_frame=tb_frame,
+                                 tb_lasti=tb_frame.f_lasti,
+                                 tb_lineno=tb_frame.f_lineno)
+
+        tb_msg = "".join(traceback.format_tb(tb, limit=tb_depth))
+
+        # Note: this is not a regular print statement -- it maps to 'drjit.print'
+        print(
+            f"Assertion failure" + ((': ' + fmt) if fmt else '!') + "\n{tb_msg}",
+            *args,
+            tb_msg=tb_msg,
+            active=active,
+            file=_sys.stderr,
+            **kwargs
+        )
+
+    else:
+        # Note: this is not a regular format statement -- it maps to 'drjit.format'
+        msg = format(
+            f"Assertion failure" + ((': ' + fmt) if fmt else '!'),
+            *args,
+            active=active,
+            **kwargs
+        )
+
+        raise AssertionError(msg)
+
+
+def assert_false(
+    cond,
+    fmt: Optional[str] = None,
+    *args,
+    tb_depth: int = 3,
+    tb_skip: int = 0,
+    **kwargs,
+):
+    """
+    Equivalent to :py:func:`assert_true` with a flipped condition ``cond``.
+    Please refer to the documentation of this function for further details.
+    """
+    return assert_true(
+        not cond if isinstance(cond, bool) else ~cond,
+        fmt,
+        *args,
+        tb_depth=tb_depth,
+        tb_skip=tb_skip+1,
+        **kwargs,
+    )
+
+def assert_equal(
+    arg0,
+    arg1,
+    fmt: Optional[str] = None,
+    *args,
+    limit: int = 3,
+    tb_skip: int = 0,
+    **kwargs,
+):
+    """
+    Equivalent to :py:func:`assert_true` with the condition ``arg0==arg1``.
+    Please refer to the documentation of this function for further details.
+    """
+    return assert_true(
+        arg0 == arg1,
+        fmt,
+        *args,
+        limit=limit,
+        tb_skip=tb_skip+1,
+        **kwargs,
+    )
+
+_clip = clip
+
+def srgb_to_linear(x: ArrayT, clip: bool = True) -> ArrayT:
+    """
+    Convert sRGB gamma-corrected values to linear intensity values.
+
+    Applies the inverse sRGB transfer function (gamma expansion) to convert
+    gamma-encoded sRGB values to linear RGB values. The sRGB transfer function
+    uses a piecewise curve with a linear segment near black for numerical stability.
+
+    When `clip=True` (default), input values are clamped to [0, 1] before conversion.
+    When `clip=False`, the transformation preserves the sign and applies the sRGB
+    curve to the absolute value, enabling round-trip conversion of out-of-gamut
+    colors. This is useful for wide-gamut workflows where colors may temporarily
+    exceed the [0, 1] range during processing.
+
+    The transformation is defined as:
+
+    .. math::
+
+        f(x) = \\begin{cases}
+            \\frac{x}{12.92} & \\text{if } x \\leq 0.04045 \\\\
+            \\left(\\frac{x + 0.055}{1.055}\\right)^{2.4} & \\text{if } x > 0.04045
+        \\end{cases}
+
+    When ``clip=False``, the transformation becomes:
+
+    .. math::
+
+        f(x) = \\text{sign}(x) \\cdot f(|x|)
+
+    Args:
+        x (ArrayT): Dr.Jit array containing sRGB gamma-corrected values.
+                   Typically in range [0, 1] for in-gamut colors.
+        clip (bool): If True, clamp input values to [0, 1]. If False, preserve
+                    sign and apply transformation to absolute values. Default: True.
+
+    Returns:
+        ArrayT: Linear intensity values. When clip=True, output is in [0, 1].
+                When clip=False, output preserves the sign of input values.
+    """
+
+    if clip:
+        x = _clip(x, 0, 1)
+        s = 1
+    else:
+        s = sign(x)
+        x = abs(x)
+
+
+    return s * select(
+        x < 0.04045,
+        x / 12.92,
+        fma(x, 1 / 1.055, 0.055 / 1.055) ** 2.4
+    )
+
+def linear_to_srgb(x: ArrayT, clip: bool = True) -> ArrayT:
+    """
+    Convert linear intensity values to sRGB gamma-corrected values.
+
+    Applies the sRGB transfer function (gamma compression) to convert linear RGB
+    values to gamma-encoded sRGB values suitable for display or storage. The sRGB
+    transfer function uses a piecewise curve with a linear segment near black for
+    numerical stability.
+
+    When `clip=True` (default), input values are clamped to [0, 1] before conversion.
+    When `clip=False`, the transformation preserves the sign and applies the sRGB
+    curve to the absolute value, enabling handling of out-of-gamut colors in
+    wide-gamut workflows.
+
+    The transformation is defined as:
+
+    .. math::
+
+        f(x) = \\begin{cases}
+            12.92 \\cdot x & \\text{if } x \\leq 0.0031308 \\\\
+            1.055 \\cdot x^{1/2.4} - 0.055 & \\text{if } x > 0.0031308
+        \\end{cases}
+
+    When ``clip=False``, the transformation becomes:
+
+    .. math::
+
+        f(x) = \\text{sign}(x) \\cdot f(|x|)
+
+    Args:
+        x (ArrayT): Dr.Jit array containing linear intensity values.
+                   Typically in range [0, 1] for in-gamut colors.
+        clip (bool): If True, clamp input values to [0, 1]. If False, preserve
+                    sign and apply transformation to absolute values. Default: True.
+
+    Returns:
+        ArrayT: sRGB gamma-corrected values. When clip=True, output is in [0, 1].
+                When clip=False, output preserves the sign of input values.
+    """
+
+    if clip:
+        x = _clip(x, 0, 1)
+        s = 1
+    else:
+        s = sign(x)
+        x = abs(x)
+
+    return s * select(
+        x < 0.0031308,
+        x * 12.92,
+        fma(1.055, x ** (1.0 / 2.4), -0.055)
+    )
+
+_SRGB_TO_LMS = [
+    0.4122214708, 0.5363325363, 0.0514459929,
+    0.2119034982, 0.6806995451, 0.1073969566,
+    0.0883024619, 0.2817188376, 0.6299787005
+]
+
+_CBRT_LMS_TO_OKLAB = [
+    0.2104542553,  0.7936177850, -0.0040720468,
+    1.9779984951, -2.4285922050, +0.4505937099,
+    0.0259040371,  0.7827717662, -0.8086757660,
+]
+
+_OKLAB_TO_CBRT_LMS = [
+    1.0,  0.3963377774,  0.2158037573,
+    1.0, -0.1055613458, -0.0638541728,
+    1.0, -0.0894841775, -1.2914855480
+]
+
+_LMS_TO_SRGB = [
+     4.0767416621, -3.3077115913,  0.2309699292,
+    -1.2684380046,  2.6097574011, -0.3413193965,
+    -0.0041960863, -0.7034186147,  1.7076147010
+]
+
+def linear_srgb_to_oklab(value: ArrayT) -> ArrayT:
+    """
+    Convert colors from linear sRGB to Oklab color space.
+
+    Oklab is a perceptual color space designed for image processing that provides
+    better perceptual uniformity than CIELAB or HSV. The L, a, b coordinates are
+    perceptually orthogonal, enabling independent manipulation of lightness, green-red
+    axis, and blue-yellow axis without perceived changes in the other dimensions.
+    Oklab produces smooth color transitions and accurately predicts human perception
+    of hue and chroma.
+
+    For more details, see: https://bottosson.github.io/posts/oklab/
+
+    This function supports Dr.Jit tensors and arrays with RGB or RGBA data.
+    For tensors, the color channels must be in the trailing dimension.
+    For arrays, the color channels must be in the leading dimension.
+    Alpha channels are preserved unchanged in RGBA inputs.
+
+    The function expects **linear sRGB** values as input, not gamma-encoded
+    sRGB. For typical gamma-encoded image data (e.g., from image files), first
+    apply :py:func:`dr.srgb_to_linear() <drjit.srgb_to_linear>` to convert to
+    linear sRGB before using this function.
+
+    Args:
+        value (dr.ArrayBase): Dr.Jit tensor or array containing **linear sRGB** colors.
+                              For tensors: shape [..., 3] for RGB or [..., 4] for RGBA.
+                              For arrays: shape [3, ...] for RGB or [4, ...] for RGBA.
+
+    Returns:
+        dr.ArrayBase: Colors converted to Oklab space with same shape as input.
+                      L represents lightness, a represents green-red axis,
+                      b represents blue-yellow axis.
+    """
+
+    if not is_array_v(value):
+        raise Exception('linear_srgb_to_oklab(): expected a Jit tensor/array type as input!')
+
+    Type = type(value)
+    shape = value.shape
+
+    if is_tensor_v(value):
+        if shape[-1] != 3 and shape[-1] != 4:
+            raise Exception('linear_srgb_to_oklab(): tensors must have trailing dimension 3 (RGB) or 4 (RGBA)')
+        value = reshape(value, (-1, shape[-1]))
+        Array = replace_shape_t(Type, (shape[-1], -1), 'array')
+        value_2 = Array(value, flip_axes=True)
+        value_2 = linear_srgb_to_oklab(value_2)
+        return reshape(Type(value_2, flip_axes = True), shape)
+    elif shape[0] == 4:
+        value_2 = Type()
+        value_2.xyz = linear_srgb_to_oklab(value.xyz)
+        value_2.w = value.w
+        return value_2
+    elif shape[0] != 3:
+        raise Exception('linear_srgb_to_oklab(): arrays must have leading dimension 3 (RGB) or 4 (RGBA)')
+
+    Matrix = replace_shape_t(Type, (3, 3), 'matrix')
+    lms = Matrix(_SRGB_TO_LMS) @ value
+    return Matrix(_CBRT_LMS_TO_OKLAB) @ cbrt(lms)
+
+def oklab_to_linear_srgb(value: ArrayT) -> ArrayT:
+    """
+    Convert colors from Oklab color space back to linear sRGB.
+
+    This function performs the inverse transformation of linear_srgb_to_oklab,
+    converting Oklab L, a, b coordinates back to linear sRGB values.
+
+    This function supports Dr.Jit tensors and arrays with Lab or LabA data.
+    For tensors, the color channels must be in the trailing dimension.
+    For arrays, the color channels must be in the leading dimension.
+    Alpha channels are preserved unchanged in LabA inputs.
+
+    This function returns **linear sRGB** values, not gamma-encoded sRGB. To
+    obtain gamma-encoded sRGB for typical image output (e.g., for display or
+    saving to image files), apply :py:func:`dr.linear_to_srgb()
+    <drjit.linear_to_srgb>` to the output of this function.
+
+    Args:
+        value (dr.ArrayBase): Dr.Jit tensor or array containing Oklab colors.
+                              For tensors: shape [..., 3] for Lab or [..., 4] for LabA.
+                              For arrays: shape [3, ...] for Lab or [4, ...] for LabA.
+
+    Returns:
+        dr.ArrayBase: Colors converted to **linear sRGB** space with same shape as input.
+                      Values are in linear sRGB (not gamma-corrected).
+    """
+
+    if not is_array_v(value):
+        raise Exception('oklab_to_linear_srgb(): expected a Jit tensor/array type as input!')
+
+    Type = type(value)
+    shape = value.shape
+
+    if is_tensor_v(value):
+        if shape[-1] != 3 and shape[-1] != 4:
+            raise Exception('oklab_to_linear_srgb(): tensors must have trailing dimension 3 (Lab) or 4 (LabA)')
+        value = reshape(value, (-1, shape[-1]))
+        Array = replace_shape_t(Type, (shape[-1], -1), 'array')
+        value_2 = Array(value, flip_axes=True)
+        value_2 = oklab_to_linear_srgb(value_2)
+        return reshape(Type(value_2, flip_axes=True), shape)
+    elif shape[0] == 4:
+        value_2 = Type()
+        value_2.xyz = oklab_to_linear_srgb(value.xyz)
+        value_2.w = value.w
+        return value_2
+    elif shape[0] != 3:
+        raise Exception('oklab_to_linear_srgb(): arrays must have leading dimension 3 (Lab) or 4 (LabA)')
+
+    Matrix = replace_shape_t(Type, (3, 3), 'matrix')
+
+    lms = (Matrix(_OKLAB_TO_CBRT_LMS) @ value)**3
+    return Matrix(_LMS_TO_SRGB) @ lms
+
+def unit_angle(a, b):
+    """
+    Numerically well-behaved routine for computing the angle between two
+    normalized 3D direction vectors
+
+    This should be used wherever one is tempted to compute the angle via
+    ``acos(dot(a, b))``. It yields significantly more accurate results when the
+    angle is close to zero.
+
+    By `Don Hatch <http://www.plunk.org/~hatch/rightway.php>`__.
+    """
+
+    dot_uv = dot(a, b)
+    temp = 2 * asin(.5 * norm(b - mulsign(a, dot_uv)))
+    return select(dot_uv >= 0, temp, pi - temp)
+
+def func(
+    f: Optional[F] = None,
+    *,
+    backend: Optional[JitBackend] = None
+):
+    """
+    Decorator that prevents the body of the decorated function from being
+    inlined into the caller, emitting it as a separate callable in the
+    generated IR instead. This can significantly reduce compilation time for
+    large programs where the decorated function is called from multiple sites.
+
+    .. code-block:: python
+
+       @dr.func
+       def f(x):
+           return x * 3
+
+       @dr.func(backend=dr.JitBackend.LLVM)
+       def g(x):
+           return x * 3
+
+    The decorated function must be *pure*: its return values should only
+    depend on its input arguments. Accessing global Dr.Jit arrays or other
+    external state from within the function can lead to errors.
+
+    The backend is automatically inferred from the function arguments on the
+    first call. Once detected, it is cached and reused for subsequent calls.
+    If the function takes no Dr.Jit array arguments (directly or within a
+    :ref:`PyTree <pytrees>`), the backend must be specified explicitly via the
+    ``backend`` parameter.
+
+    Args:
+        f (Callable): The function to decorate.
+
+        backend (Optional[JitBackend]): Backend to use for the generated
+          function. If specified, this always takes priority over automatic
+          detection. If not specified, the backend is inferred from the
+          arguments on the first call.
+    """
+    backend = backend if backend is not None else JitBackend.Invalid
+
+    def _detect_backend(*args, **kwargs):
+        def check(a):
+            b = backend_v(a)
+            if b != JitBackend.Invalid:
+                return b
+            tp = type(a)
+            if tp is list or tp is tuple:
+                for v in a:
+                    b = check(v)
+                    if b != JitBackend.Invalid:
+                        return b
+            elif tp is dict:
+                for v in a.values():
+                    b = check(v)
+                    if b != JitBackend.Invalid:
+                        return b
+            elif type(getattr(tp, 'DRJIT_STRUCT', None)) is dict:
+                for k in tp.DRJIT_STRUCT:
+                    b = check(getattr(a, k))
+                    if b != JitBackend.Invalid:
+                        return b
+            elif hasattr(tp, '__dataclass_fields__'):
+                for k in tp.__dataclass_fields__:
+                    b = check(getattr(a, k))
+                    if b != JitBackend.Invalid:
+                        return b
+            return JitBackend.Invalid
+
+        for a in args:
+            b = check(a)
+            if b != JitBackend.Invalid:
+                return b
+        for a in kwargs.values():
+            b = check(a)
+            if b != JitBackend.Invalid:
+                return b
+        return JitBackend.Invalid
+
+
+    def decorator(f):
+        cached_backend = JitBackend.Invalid
+
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            nonlocal cached_backend
+            if backend != JitBackend.Invalid:
+                b = backend
+            elif cached_backend != JitBackend.Invalid:
+                b = cached_backend
+            else:
+                b = _detect_backend(*args, **kwargs)
+                if b == JitBackend.Invalid:
+                    raise RuntimeError(
+                        "dr.func(): could not detect the backend from the "
+                        "input arguments. Please specify it explicitly via "
+                        "the 'backend' parameter.")
+                cached_backend = b
+            m = _sys.modules[f'drjit.{b.name.lower()}']
+            tp = m.UInt32
+            return switch(tp(0), [f], *args, label=f"{f.__name__}", **kwargs)
+
+        return wrapper
+
+    if f is not None:
+        return decorator(f)
+    return decorator
+
+
+newaxis = None
+
+from . import hashgrid as hashgrid
+from . import nn as nn
+
+del overload, Optional

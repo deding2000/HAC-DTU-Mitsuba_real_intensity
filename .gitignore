@@ -1,0 +1,24 @@
+# Project
+challenge_data/
+challenge_data.zip
+
+logs/
+
+*.mp4
+*.obj
+*.stl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Marimo
+__marimo__/
+
+# Editor
+*.code-workspace
+
+# Env
+.env
+

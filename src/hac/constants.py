@@ -1,0 +1,230 @@
+import os
+from collections.abc import Sequence
+from pathlib import Path
+
+from hac.types import ObserverGeometry
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+_default_project_dir = Path(__file__).resolve().parents[2]
+PROJECT_DIR = Path(os.environ.get("HAC_PROJECT_DIR", _default_project_dir)).resolve()
+assert PROJECT_DIR.is_dir(), f"PROJECT_DIR {PROJECT_DIR} is not a directory"
+
+_workspace_user = os.environ.get("HAC_WORKSPACE_USER", "default")
+WORKSPACE_DIR = PROJECT_DIR / "workspaces" / _workspace_user
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Backwards-compatible path
+DSDIR_ENV_VAR = "DSDIR"
+def _resolve_challenge_data_dir() -> Path:
+    dsdir = os.environ.get(DSDIR_ENV_VAR)
+    if not dsdir:
+        return PROJECT_DIR / "challenge_data"
+
+    challenge_data_dir = Path(dsdir).expanduser()
+    if challenge_data_dir.name != "challenge_data":
+        challenge_data_dir = challenge_data_dir / "challenge_data"
+
+    return challenge_data_dir.resolve()
+CHALLENGE_DATA_DIR = PROJECT_DIR / "challenge_data"
+if os.environ.get(DSDIR_ENV_VAR):
+    CHALLENGE_DATA_DIR = _resolve_challenge_data_dir()
+
+assert CHALLENGE_DATA_DIR.is_dir(), f"CHALLENGE_DATA_DIR {CHALLENGE_DATA_DIR} is not a directory"
+
+# Maps position id to camera angle alpha in degrees
+# See: https://fips.fi/data-challenges/helsinki-asteroid-challenge-2026/
+# This is left for backwards-compatibility, but may be removed in the future
+# Consider using OBSERVERS instead
+CAMERA_ANGLE_ALPHA: dict[str, float] = {
+    "0_hor1": 0.0,
+    "0_hor2": 0.0,
+    "0_top": 21.0,
+    "0_bottom": -21.0,
+    "45_hor1": 0.0,
+    "45_hor2": 0.0,
+    "45_top": 26.0,
+    "45_bottom": -24.0,
+    "90_hor1": 0.0,
+    "90_hor2": 0.0,
+    "90_top": 26.0,
+    "90_bottom": -24.0,
+    "135_hor1": 0.0,
+    "135_hor2": 0.0,
+    "135_top": 26.0,
+    "135_bottom": -24.0,
+    "225_hor1": 0.0,
+    "225_hor2": 0.0,
+    "225_top": 24.0,
+    "225_bottom": -26.0,
+    "270_hor1": 0.0,
+    "270_hor2": 0.0,
+    "270_top": 24.0,
+    "270_bottom": -26.0,
+    "315_hor1": 0.0,
+    "315_hor2": 0.0,
+    "315_top": 24.0,
+    "315_bottom": -26.0,
+}
+
+# All observer positions according to https://fips.fi/data-challenges/helsinki-asteroid-challenge-2026/
+_DEFAULT_OBSERVER_DISTANCE = 5.0  # Must be greater than largest asteroid radius (3.95)
+OBSERVERS: dict[str, ObserverGeometry] = {
+    "0_hor1": ObserverGeometry(theta=0.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE),
+    "0_hor2": ObserverGeometry(theta=0.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE),
+    "0_top": ObserverGeometry(theta=0.0, alpha=21.0, r_obs=_DEFAULT_OBSERVER_DISTANCE),
+    "0_bottom": ObserverGeometry(
+        theta=0.0, alpha=-21.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "45_hor1": ObserverGeometry(
+        theta=45.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "45_hor2": ObserverGeometry(
+        theta=45.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "45_top": ObserverGeometry(
+        theta=45.0, alpha=26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "45_bottom": ObserverGeometry(
+        theta=45.0, alpha=-24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "90_hor1": ObserverGeometry(
+        theta=90.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "90_hor2": ObserverGeometry(
+        theta=90.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "90_top": ObserverGeometry(
+        theta=90.0, alpha=26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "90_bottom": ObserverGeometry(
+        theta=90.0, alpha=-24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "135_hor1": ObserverGeometry(
+        theta=135.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "135_hor2": ObserverGeometry(
+        theta=135.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "135_top": ObserverGeometry(
+        theta=135.0, alpha=26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "135_bottom": ObserverGeometry(
+        theta=135.0, alpha=-24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "225_hor1": ObserverGeometry(
+        theta=225.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "225_hor2": ObserverGeometry(
+        theta=225.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "225_top": ObserverGeometry(
+        theta=225.0, alpha=24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "225_bottom": ObserverGeometry(
+        theta=225.0, alpha=-26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "270_hor1": ObserverGeometry(
+        theta=270.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "270_hor2": ObserverGeometry(
+        theta=270.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "270_top": ObserverGeometry(
+        theta=270.0, alpha=24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "270_bottom": ObserverGeometry(
+        theta=270.0, alpha=-26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "315_hor1": ObserverGeometry(
+        theta=315.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "315_hor2": ObserverGeometry(
+        theta=315.0, alpha=0.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "315_top": ObserverGeometry(
+        theta=315.0, alpha=24.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+    "315_bottom": ObserverGeometry(
+        theta=315.0, alpha=-26.0, r_obs=_DEFAULT_OBSERVER_DISTANCE
+    ),
+}
+
+# The bounding cylinder radius for each asteroid model
+MODEL_BASE_RADII: dict[int, float] = {
+    1: 1.12,
+    2: 1.42,
+    3: 0.88,
+    4: 1.475,
+    5: 1.22,
+    6: 0.925,
+    7: 1.205,
+    8: 1.24,
+    9: 0.67,
+    10: 3.95,
+    # Synthetic PyVista-primitive asteroids (pyramid, cone, capsule, torus),
+    # added to validate inversion techniques against known non-challenge
+    # shapes -- see workspaces/christian/generate_synthetic_asteroids.py.
+    # Radii drawn once via np.random.default_rng(seed=42).uniform(0.5, 4.0,
+    # size=10), matching the challenge models' radius range. (11-14 were
+    # drawn first with size=4, then extended to size=7 for 15-17, then
+    # size=10 for 18-20 -- numpy's Generator.uniform is prefix-consistent
+    # for a fixed seed, verified before hardcoding each time.)
+    11: 3.2088,
+    12: 2.0361,
+    13: 3.5051,
+    14: 2.9408,
+    15: 0.8296,
+    16: 3.9147,
+    17: 3.1640,
+    18: 3.2512,
+    19: 0.9484,
+    20: 2.0764,
+    # Real non-convex asteroids from DAMIT (https://damit.cuni.cz), used to
+    # validate against genuine non-convex shapes rather than only synthetic
+    # ones -- see workspaces/christian/generate_synthetic_asteroids.py.
+    # Radii continue the SAME np.random.default_rng(seed=42).uniform(0.5,
+    # 4.0, ...) draw used for 11-20, extended from size=10 to size=17
+    # (prefix-consistency verified before hardcoding, as before).
+    21: 1.7978,
+    22: 3.7437,
+    23: 2.7535,
+    24: 3.3797,
+    25: 2.0519,
+    26: 1.2953,
+    27: 2.4410,
+}
+# Backward compatibility
+BASE_RADII = list(MODEL_BASE_RADII.values())
+
+
+class NamedAngleSequence(Sequence):
+    def __init__(self, names: list[str], values: list[float | int]):
+        self.names = names
+        self.values = values
+        self.by_name = dict(zip(names, values))
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self.by_name[key]
+        return self.values[key]
+
+    def __len__(self):
+        return len(self.values)
+
+
+POSITION_IDS = list(CAMERA_ANGLE_ALPHA.keys())
+
+XY_ANGLES = NamedAngleSequence(
+    POSITION_IDS,
+    [int(position_id.split("_", 1)[0]) for position_id in POSITION_IDS],
+)
+
+ELEV_ANGLES = NamedAngleSequence(
+    POSITION_IDS,
+    [CAMERA_ANGLE_ALPHA[position_id] for position_id in POSITION_IDS],
+)
+
+INTENSITY_CURVE_THRESHOLD = 25.5

@@ -1,0 +1,80 @@
+# CMake
+CMakeFiles
+CMakeCache.txt
+/CPackConfig.cmake
+/CPackSourceConfig.cmake
+cmake_install.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+
+# Ninja
+.ninja_deps
+.ninja_log
+*.ninja
+
+# Miscellaneous;
+/build*
+/Testing
+/tests/Testing
+/.cache
+*.dir
+*~
+\.DS_Store
+*.dSYM
+__pycache__
+*.pyc
+
+# Visual Studio
+*.vcxproj
+*.vcxproj.user
+*.iobj
+*.ipdb
+drjit.sdf
+drjit.sln
+drjit.opensdf
+drjit.VC.VC.opendb
+drjit.VC.db
+Debug
+Release
+*.filters
+/.vs
+/x64
+
+# Visual Studio Code
+/.vscode
+
+# Build products
+compile_commands.json
+tests/*.so
+libdrjit-core.so
+libdrjit-core.dylib
+drjit-core.dll
+libdrjit-extra.so
+libdrjit-extra.dylib
+drjit-extra.dll
+libnanobind-static.a
+libnanobind-static-abi3.a
+libnanothread.so
+libnanothread.dylib
+nanothread.dll
+libnanobind-drjit.dylib
+libnanobind-drjit.so
+docstr.h
+nanobind-drjit.dll
+_drjit_ext.cp*
+_drjit_ext.abi3.*
+py\.typed
+/drjitConfig.cmake
+/drjitConfigVersion.cmake
+drjit/config.py
+*\.pyi
+/drjit/llvm
+/drjit/cuda
+/drjit/metal
+/drjit/auto
+
+# Documentation
+/html
+/docs/.build

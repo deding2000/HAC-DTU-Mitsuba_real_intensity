@@ -1,0 +1,175 @@
+/*
+    src/eval.h -- Main computation graph evaluation routine
+
+    Copyright (c) 2021 Wenzel Jakob <wenzel.jakob@epfl.ch>
+
+    All rights reserved. Use of this source code is governed by a BSD-style
+    license that can be found in the LICENSE file.
+*/
+
+#pragma once
+
+#include "internal.h"
+#include "strbuf.h"
+#include <map>
+#include <vector>
+
+/// A single variable that is scheduled to execute for a launch with 'size' entries
+struct ScheduledVariable {
+    uint32_t size;
+    uint32_t index;
+    uint32_t scope;
+    void *data;
+
+    ScheduledVariable() = default;
+
+    ScheduledVariable(uint32_t size, uint32_t scope, uint32_t index)
+        : size(size), index(index), scope(scope), data(nullptr) { }
+};
+
+/// Start and end index of a group of variables that will be merged into the same kernel
+struct ScheduledGroup {
+    uint32_t size;
+    uint32_t start;
+    uint32_t end;
+
+    ScheduledGroup(uint32_t size, uint32_t start, uint32_t end)
+        : size(size), start(start), end(end) { }
+};
+
+enum class GlobalType : uint32_t {
+    IndirectCallable = 0, // Multi-target vcalls, assembled first
+    Callable = 1,         // Single-target vcalls, assembled second
+    Global = 2,           // Other globals (intrinsics, etc.), assembled last
+    Type = 3              // Type definitions, hoisted before everything else
+};
+
+struct GlobalKey {
+    XXH128_hash_t hash;
+    GlobalType type;
+
+    GlobalKey(XXH128_hash_t hash, GlobalType type)
+        : hash(hash), type(type) { }
+
+    /* Order so that callables are defined before other globals, but don't use
+       the callable ID itself for ordering (it can be non-deterministic in
+       programs that use Dr.Jit with parallelization) */
+    bool operator<(const GlobalKey &v) const {
+        return std::tie(type, hash.high64, hash.low64) <
+               std::tie(v.type, v.hash.high64, v.hash.low64);
+    }
+};
+
+struct GlobalValue {
+    /// Offset and length for the 'globals' buffer
+    size_t start, length;
+
+    /// Index within the callable list, if applicable
+    uint32_t callable_index;
+
+    GlobalValue(size_t start, size_t length)
+        : start(start), length(length), callable_index(0) { }
+};
+
+/// Cache data structure for global declarations
+using GlobalsMap = std::map<GlobalKey, GlobalValue>;
+
+/// StringBuffer for global definitions (intrinsics, callables, etc.)
+extern StringBuffer globals;
+
+/// Mapping that describes the contents of the 'globals' buffer
+extern GlobalsMap globals_map;
+
+/// Name of the last generated kernel
+extern char kernel_name[52];
+
+/// Are we recording an OptiX kernel?
+extern bool uses_optix;
+
+/// Does this kernel use Metal 4 language features (e.g., matmul2d)?
+extern bool uses_metal4;
+
+/// Size and alignment of auxiliary buffer needed by virtual function calls
+extern int32_t alloca_size;
+extern int32_t alloca_align;
+
+/// Number of tentative callables that were assembled in the kernel being compiled
+extern uint32_t indirect_callable_count;
+
+/// Number of unique callables in the kernel being compiled
+extern uint32_t indirect_callable_count_unique;
+
+/// Specifies the nesting level of virtual calls being compiled
+extern uint32_t callable_depth;
+
+/// Ordered list of variables that should be computed
+extern std::vector<ScheduledVariable> schedule;
+
+/* Generation counter used to detect already-visited variables during graph
+   traversal (see the detailed comment in eval.cpp). The same counter is shared
+   by jit_eval() scheduling and jitc_var_call_analyze(); a single monotonic
+   counter guarantees stamps from one phase can never be misread by the other. */
+extern uint32_t visit_gen;
+
+/// Begin a fresh visit generation, invalidating all prior Variable::scratch stamps
+extern void jitc_visit_new_gen();
+
+/// Track kernel parameter metadata (writability, GPU resource kind)
+extern std::vector<KernelParamInfo> kernel_param_info;
+
+/// Evaluate all computation that is queued on the current thread
+extern void jitc_eval(ThreadState *ts);
+
+/// Used by jitc_eval() to generate PTX source code
+extern void jitc_cuda_assemble(ThreadState *ts, ScheduledGroup group,
+                               uint32_t n_regs, uint32_t n_params);
+
+/// Used by jitc_eval() to generate LLVM IR source code
+extern void jitc_llvm_assemble(ThreadState *ts, ScheduledGroup group);
+
+/// Used by jitc_call() to generate source code for calls
+struct CallData;
+extern XXH128_hash_t jitc_assemble_func(const CallData *call, uint32_t inst,
+                                        uint32_t in_size, uint32_t in_align,
+                                        uint32_t out_size, uint32_t out_align);
+
+/// Used by jitc_call() to generate LLVM IR source code for callables
+extern void jitc_llvm_assemble_func(const CallData *call, uint32_t inst);
+
+/// Used by jitc_call() to generate PTX source code for callables
+extern void jitc_cuda_assemble_func(const CallData *call, uint32_t inst,
+                                    uint32_t in_size, uint32_t in_align,
+                                    uint32_t out_size, uint32_t out_align,
+                                    uint32_t n_regs);
+
+#if defined(DRJIT_ENABLE_METAL)
+struct Kernel;
+
+/// Used by jitc_eval() to generate Metal Shading Language source code. Declared
+/// here (rather than in metal_eval.h) so that eval.cpp does not pull in that
+/// header's MSL codegen macros. Mirrors the CUDA/LLVM assemble entry points.
+extern void jitc_metal_assemble(ThreadState *ts, ScheduledGroup group,
+                                uint32_t n_regs, uint32_t n_params);
+
+/// Used by jitc_call() to generate MSL source code for callables
+extern void jitc_metal_assemble_func(const CallData *call, uint32_t inst,
+                                     uint32_t in_size, uint32_t in_align,
+                                     uint32_t out_size, uint32_t out_align,
+                                     uint32_t n_regs);
+
+/// Reset per-kernel Metal assembly state at the start of jitc_eval()
+extern void jitc_metal_assemble_reset();
+
+/// Produce an indented copy of the assembled MSL for the PrintIR / console IR
+/// dump. The main code buffer stays unformatted. Returns a scratch pointer
+/// valid until the next call; ``*size_out`` receives its length if non-null.
+extern const char *jitc_metal_format(size_t *size_out = nullptr);
+
+/// Args index of the bindless slot reserved for the kernel's visible function
+/// table, or -1 if the kernel performs no calls. Set by jitc_assemble().
+extern int metal_vft_arg_index;
+#endif
+
+/// Register a global declaration that will be included in the final program
+extern void jitc_register_global(const char *str,
+                                 GlobalType type = GlobalType::Global);

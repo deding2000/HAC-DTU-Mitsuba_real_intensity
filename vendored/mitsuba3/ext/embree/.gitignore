@@ -1,0 +1,16 @@
+*.user
+Win32
+x64
+*.suo
+*.ncb
+.*sw?
+.DS_Store
+kernels/config.h
+kernels/hash.h
+kernels/export.linux.map
+kernels/export.macosx.map
+
+include/embree3/rtcore_config.h
+build
+cmake_install.cmake
+uninstall.cmake

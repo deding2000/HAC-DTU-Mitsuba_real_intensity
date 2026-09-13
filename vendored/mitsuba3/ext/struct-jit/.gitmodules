@@ -1,0 +1,6 @@
+[submodule "ext/cmake-defaults"]
+    path = ext/cmake-defaults
+    url = https://github.com/mitsuba-renderer/cmake-defaults
+[submodule "ext/nanobind"]
+	path = ext/nanobind
+	url = https://github.com/wjakob/nanobind

@@ -1,0 +1,422 @@
+/*
+    src/cuda_packet.cpp -- Specialized memory operations that read or write
+    multiple adjacent values at once.
+
+    Copyright (c) 2024 Wenzel Jakob <wenzel.jakob@epfl.ch>
+
+    All rights reserved. Use of this source code is governed by a BSD-style
+    license that can be found in the LICENSE file.
+*/
+
+#include "eval.h"
+#include "cuda_eval.h"
+#include "var.h"
+#include "op.h"
+#include "log.h"
+#include "cuda_scatter.h"
+
+void jitc_cuda_render_gather_packet(const Variable *v, const Variable *ptr,
+                                    const Variable *index, const Variable *mask) {
+    bool is_masked = !mask->is_literal() || mask->literal != 1,
+         is_bool   = (VarType) v->type == VarType::Bool;
+
+    uint32_t count = (uint32_t) v->literal,
+             tsize = type_size[v->type],
+             total_bytes = count * tsize;
+
+    bool supports_256bit =
+        jitc_cuda_supports_256bit(thread_state_cuda, uses_optix);
+
+    fmt("    mad.wide.$t %rd3, $v, $u, $v;\n"
+        "    .reg.$t $v_out_<$u>;\n",
+        index, index, total_bytes, ptr,
+        v, v, count);
+
+    const char *suffix, *out_name = "out";
+
+    if (is_bool) {
+        fmt("    .reg.b8 $v_tmp2_<$u>;\n", v, count);
+        out_name = "tmp2";
+    }
+
+    // Number of output/temporary output registers and their size
+    uint32_t dst_count = count,
+             out_bits = tsize * 8,
+             dst_bits = out_bits;
+
+    if (tsize >= 4) {
+        suffix = "out";
+    } else {
+        // Source size is sub-word, gather larger values and decode
+        if (total_bytes % 4 == 0) {
+            dst_bits = 32;
+            dst_count = total_bytes / 4;
+        } else {
+            dst_bits = 16;
+            dst_count = total_bytes / 2;
+        }
+        fmt("    .reg.b$u $v_tmp_<$u>;\n",
+            dst_bits, v, dst_count);
+        suffix = "tmp";
+    }
+
+    if (is_masked) {
+        for (uint32_t i = 0; i < dst_count; ++i)
+            fmt("    mov.b$u $v_$s_$u, 0;\n", dst_bits, v, suffix, i);
+    }
+
+    // Try to load 256b/iteration if supported, otherwise 128b/iteration
+    // Potentially reduce if the total size of the load isn't divisible
+    uint32_t bytes_per_it = supports_256bit ? 32 : 16;
+    while ((total_bytes & (bytes_per_it - 1)) != 0)
+        bytes_per_it /= 2;
+    uint32_t regs_per_it = (bytes_per_it * 8) / dst_bits;
+
+    // Actually load the packets into the `_tmp` registers (or directly into the `_out` registers
+    // if the output type size is large enough).
+    for (uint32_t byte_offset = 0; byte_offset < total_bytes; byte_offset += bytes_per_it) {
+        uint32_t reg_offset = (byte_offset * 8) / dst_bits;
+        if (is_masked)
+            fmt("    @$v ", mask);
+        else
+            put("    ");
+
+        switch (regs_per_it) {
+            case 1:
+                fmt("ld.global.nc.b$u $v_$s_$u, [%rd3+$u];\n",
+                    dst_bits, v, suffix, reg_offset, byte_offset);
+                break;
+
+            case 2:
+                fmt("ld.global.nc.v2.b$u {$v_$s_$u, $v_$s_$u}, [%rd3+$u];\n",
+                    dst_bits, v, suffix, reg_offset, v, suffix, reg_offset + 1, byte_offset);
+                break;
+
+            case 4:
+                fmt("ld.global.nc.v4.b$u {$v_$s_$u, $v_$s_$u, $v_$s_$u, $v_$s_$u}, [%rd3+$u];\n",
+                    dst_bits,
+                    v, suffix, reg_offset,
+                    v, suffix, reg_offset+1,
+                    v, suffix, reg_offset+2,
+                    v, suffix, reg_offset+3,
+                    byte_offset);
+                break;
+
+            case 8:
+                fmt("ld.global.nc.v8.b$u {$v_$s_$u, $v_$s_$u, $v_$s_$u, $v_$s_$u, "
+                    "$v_$s_$u, $v_$s_$u, $v_$s_$u, $v_$s_$u}, [%rd3+$u];\n",
+                    dst_bits,
+                    v, suffix, reg_offset,
+                    v, suffix, reg_offset+1,
+                    v, suffix, reg_offset+2,
+                    v, suffix, reg_offset+3,
+                    v, suffix, reg_offset+4,
+                    v, suffix, reg_offset+5,
+                    v, suffix, reg_offset+6,
+                    v, suffix, reg_offset+7,
+                    byte_offset);
+                break;
+
+            default:
+                jitc_fail("jitc_cuda_render_gather_packet(): internal failure!");
+        }
+    }
+
+    // Unpack the values into the `_out` registers, if needed.
+    if (tsize == 1) {
+        uint32_t outputs_per_tmp = dst_bits / out_bits;
+
+        for (uint32_t i = 0; i < dst_count; ++i) {
+            if (outputs_per_tmp == 1) {
+                fmt("    mov.b$u $v_$s_$u, $v_tmp_$u;\n",
+                    dst_bits, v, out_name, i, v, i);
+            } else if (outputs_per_tmp == 2) {
+                fmt("    mov.b$u {$v_$s_$u, $v_$s_$u}, $v_tmp_$u;\n",
+                    dst_bits,
+                    v, out_name, 2 * i,
+                    v, out_name, 2 * i + 1,
+                    v, i);
+            } else if (outputs_per_tmp == 4) {
+                fmt("    mov.b$u {$v_$s_$u, $v_$s_$u, $v_$s_$u, $v_$s_$u}, $v_tmp_$u;\n",
+                    dst_bits,
+                    v, out_name, 4 * i,
+                    v, out_name, 4 * i + 1,
+                    v, out_name, 4 * i + 2,
+                    v, out_name, 4 * i + 3,
+                    v, i);
+            } else {
+                jitc_fail("jitc_cuda_render_gather_packet: internal error!");
+            }
+        }
+    } else if (tsize == 2) {
+        for (uint32_t i = 0; i < count/2; ++i) {
+            fmt("    mov.b$u {$v_$s_$u, $v_$s_$u}, $v_tmp_$u;\n",
+                dst_bits, v, out_name, 2*i, v, out_name, 2*i+1, v, i);
+        }
+    }
+
+    if (is_bool) {
+        for (uint32_t i = 0; i < count; ++i) {
+            fmt("    cvt.u16.u8 %w3, $v_tmp2_$u;\n"
+                "    setp.ne.u16 $v_out_$u, %w3, 0;\n",
+                v, i,
+                v, i);
+        }
+    }
+}
+
+/// Render the PTX to scatter-reduce a variable packet
+void jitc_cuda_render_scatter_reduce_packet(const Variable *v,
+                                            const Variable *ptr,
+                                            const Variable *index,
+                                            const Variable *mask) {
+    bool is_masked         = !mask->is_literal() || mask->literal != 1;
+    PacketScatterData *psd = (PacketScatterData *) v->data;
+    const std::vector<uint32_t> &values = psd->values;
+    const Variable *v0                  = jitc_var(values[0]);
+    const ReduceOp op = psd->op;
+    const char *op_name = cuda_reduce_op_name[(uint32_t) psd->op];
+    const ThreadState *ts = thread_state_cuda;
+
+    uint32_t count = (uint32_t) values.size(),
+             tsize = type_size[v0->type];
+
+    if (count % 2 != 0)
+        jitc_fail("jitc_cuda_render_scatter_reduce_packet(): Number of "
+                  "elements not supported by reduction.");
+
+    // Neww packet reduction instructions require CC 9.0+ and for OptiX: CUDA driver 13.2+
+    bool new_vector_ops_available = ts->compute_capability >= 90 &&
+                                    (!uses_optix ||
+                                     (jitc_cuda_version_major > 13 ||
+                                      (jitc_cuda_version_major == 13 && jitc_cuda_version_minor >= 2)));
+
+    // Actually OptiX packed half reduction for vector width > 2 is still broken atm :-(
+    if (uses_optix && v0->type == (uint32_t) VarType::Float16)
+        new_vector_ops_available = false;
+
+    // `match.any.sync` (used by the butterfly) requires PTX 6.3+ and sm_70+.
+    bool warp_reduce_supported = ts->ptx_version >= 63 && ts->compute_capability >= 70 &&
+                       (v0->type == (uint32_t) VarType::UInt32 ||
+                        v0->type == (uint32_t) VarType::Int32 ||
+                        v0->type == (uint32_t) VarType::Float32 ||
+                        v0->type == (uint32_t) VarType::UInt64 ||
+                        v0->type == (uint32_t) VarType::Int64 ||
+                        v0->type == (uint32_t) VarType::Float64);
+
+    if (psd->mode == ReduceMode::Local && warp_reduce_supported) {
+        // The combination of warp-local pre-reduction + vector atomics are
+        // restricted to Float32 for the time being
+        bool use_packet_atomics = v0->type == (uint32_t) VarType::Float32 &&
+                                 new_vector_ops_available;
+        uint32_t uid = v->reg_index;
+
+        // Compute the packet base address, then emit the inline butterfly
+        fmt("    mad.wide.$t %rd3, $v, $u, $v;\n", index, index, tsize, ptr);
+
+        if (is_masked)
+            fmt("    @!$v bra l_packet_warp_reduce_done_$u;\n", mask, uid);
+
+        jitc_cuda_render_warp_reduce(count, values.data(), (VarType) v0->type, op,
+                                     use_packet_atomics);
+
+        if (is_masked)
+            fmt("\nl_packet_warp_reduce_done_$u:\n", uid);
+
+        return;
+    }
+
+    if (new_vector_ops_available &&
+        (v0->type == (uint32_t) VarType::Float16 ||
+         v0->type == (uint32_t) VarType::Float32)) {
+        // Try to reduce to the biggest of the following PTX operations
+        // - red.global.vX.f32: packet sizes 2, 4
+        // - red.global.vX.f16: packet sizes 2, 4, 8
+
+        uint32_t max_bytes = 16;
+        uint32_t vars_per_it = max_bytes / tsize;
+        while ((count & (vars_per_it - 1)) != 0)
+            vars_per_it /= 2;
+
+        fmt("    mad.wide.$t %rd3, $v, $u, $v;\n", index, index, tsize,
+            ptr);
+
+        const char *qualifier =
+            v0->type == (uint32_t) VarType::Float16 ? ".noftz" : "";
+
+        VarType vt = (VarType) v0->type;
+        const char *tp = jitc_cuda_reduce_tp(vt, op);
+
+        for (uint32_t i = 0; i < count; i += vars_per_it) {
+            uint32_t byte_offset = i * tsize;
+
+            if (is_masked)
+                fmt("    @$v ", mask);
+            else
+                put("    ");
+            fmt("red.global.v$u.$s.$s$s [%rd3+$u], {",
+                vars_per_it, tp, op_name, qualifier, byte_offset);
+
+            for (uint32_t j = 0; j < vars_per_it; j++) {
+                fmt("$v, ", jitc_var(values[i + j]));
+            }
+            buffer.delete_trailing_commas();
+            put("};\n");
+        }
+    } else if (v0->type == (uint32_t) VarType::Float16 && op == ReduceOp::Add) {
+        // Otherwise, use the `.f16x2` reduction that's always available
+
+        fmt("    .reg.f16x2 $v_tmp;\n"
+            "    mad.wide.$t %rd3, $v, $u, $v;\n",
+            v,
+            index, index, tsize, ptr);
+
+        for (uint32_t i = 0; i < count; i += 2) {
+            uint32_t byte_offset = i * tsize;
+
+            fmt("    mov.b32 $v_tmp, {$v, $v};\n", v, jitc_var(values[i]),
+                jitc_var(values[i + 1]));
+
+            if (is_masked)
+                fmt("    @$v ", mask);
+            else
+                put("        ");
+            fmt("red.global.add.noftz.f16x2 [%rd3+$u], $v_tmp;\n",
+                byte_offset, v);
+        }
+    } else {
+        // Fallback: reduce to scalar atomics
+        const char *qualifier =
+            v0->type == (uint32_t) VarType::Float16 ? ".noftz" : "";
+
+        VarType vt = (VarType) v0->type;
+        const char *tp = jitc_cuda_reduce_tp(vt, op);
+
+        fmt("    mad.wide.$t %rd3, $v, $u, $v;\n",
+            index, index, tsize, ptr);
+        for (uint32_t i = 0; i < count; i++){
+            if (is_masked)
+                fmt("    @$v ", mask);
+            else
+                put("        ");
+            fmt("red.global.$s$s.$s [%rd3+$u], $v;\n",
+                op_name, qualifier, tp, i * tsize, jitc_var(values[i]));
+        }
+    }
+}
+
+void jitc_cuda_render_scatter_packet(const Variable *v, const Variable *ptr,
+                                     const Variable *index,
+                                     const Variable *mask) {
+    bool is_masked = !mask->is_literal() || mask->literal != 1;
+    PacketScatterData *psd = (PacketScatterData *) v->data;
+    const std::vector<uint32_t> &values = psd->values;
+    const Variable *v0 = jitc_var(values[0]);
+
+    // Handle non-Identitiy reduction case
+    if (psd->op != ReduceOp::Identity) {
+        jitc_cuda_render_scatter_reduce_packet(v, ptr, index, mask);
+        return;
+    }
+
+    bool supports_256bit =
+        jitc_cuda_supports_256bit(thread_state_cuda, uses_optix);
+
+    uint32_t count = (uint32_t) values.size(),
+             tsize = type_size[v0->type],
+             total_bytes = count * tsize;
+
+    // Number of output/temporary output registers and their size
+    uint32_t var_count = count,
+             var_bits = tsize*8;
+
+    if (tsize < 4) {
+        // Target size is sub-word, merge into 32 bit registers first
+        if (total_bytes % 4 == 0) {
+            var_bits = 32;
+            var_count = total_bytes / 4;
+        } else {
+            var_bits = 16;
+            var_count = total_bytes / 2;
+        }
+    }
+
+    fmt("    mad.wide.$t %rd3, $v, $u, $v;\n"
+        "    .reg.b$u $v_<$u>;\n",
+        index, index, tsize, ptr,
+        var_bits, v, var_count);
+
+    // Try to store 256b/iteration if supported, otherwise 128b/iteration
+    uint32_t bytes_per_it = supports_256bit ? 32 : 16;
+
+    // Potentially reduce if the total size of the store isn't divisible
+    while ((total_bytes & (bytes_per_it - 1)) != 0)
+        bytes_per_it /= 2;
+
+    uint32_t var_ratio = count / var_count;
+
+    for (uint32_t i = 0; i < var_count; ++i) {
+        if (v0->type == (uint32_t) VarType::Bool) {
+            fmt("    mov.b$u $v_$u, 0;\n", var_bits, v, i);
+            for (uint32_t j = 0; j < var_ratio; ++j)
+                fmt("    @$v or.b$u $v_$u, $v_$u, $u;\n",
+                    jitc_var(values[var_ratio*i+j]), var_bits, v, i, v, i, 1 << (8*j));
+        } else if (count == var_count) {
+            fmt("    mov.b$u $v_$u, $v;\n",
+                var_bits, v, i, jitc_var(values[i]));
+        } else if (count == var_count * 2) {
+            fmt("    mov.b$u $v_$u, {$v, $v};\n",
+                var_bits, v, i, jitc_var(values[2*i]), jitc_var(values[2*i+1]));
+        } else if (count == var_count * 4) {
+            fmt("    mov.b$u $v_$u, {$v, $v, $v, $v};\n",
+                var_bits, v, i,
+                jitc_var(values[4*i]),
+                jitc_var(values[4*i+1]),
+                jitc_var(values[4*i+2]),
+                jitc_var(values[4*i+3]));
+        } else {
+            jitc_fail("jitc_cuda_render_scatter_packet(): internal failure! (1)");
+        }
+    }
+
+    uint32_t regs_per_it = (bytes_per_it * 8) / var_bits;
+    for (uint32_t byte_offset = 0; byte_offset < total_bytes; byte_offset += bytes_per_it) {
+        uint32_t reg_offset = (byte_offset * 8) / var_bits;
+        if (is_masked)
+            fmt("    @$v ", mask);
+        else
+            put("    ");
+
+        switch (regs_per_it) {
+            case 1:
+                fmt("st.global.b$u [%rd3+$u], $v_$u;\n",
+                    var_bits, byte_offset, v, reg_offset);
+                break;
+
+            case 2:
+                fmt("st.global.v2.b$u [%rd3+$u], {$v_$u, $v_$u};\n",
+                    var_bits, byte_offset, v, reg_offset, v, reg_offset + 1);
+                break;
+
+            case 4:
+                fmt("st.global.v4.b$u [%rd3+$u], {$v_$u, $v_$u, $v_$u, $v_$u};\n",
+                    var_bits, byte_offset,
+                    v, reg_offset,   v, reg_offset+1,
+                    v, reg_offset+2, v, reg_offset+3);
+                break;
+
+            case 8:
+                fmt("st.global.v8.b$u [%rd3+$u], {$v_$u, $v_$u, $v_$u, $v_$u, "
+                    "$v_$u, $v_$u, $v_$u, $v_$u};\n",
+                    var_bits, byte_offset,
+                    v, reg_offset,   v, reg_offset+1,
+                    v, reg_offset+2, v, reg_offset+3,
+                    v, reg_offset+4, v, reg_offset+5,
+                    v, reg_offset+6, v, reg_offset+7);
+                break;
+
+            default:
+                jitc_fail("jitc_cuda_render_scatter_packet(): internal failure! (2)");
+        }
+    }
+}

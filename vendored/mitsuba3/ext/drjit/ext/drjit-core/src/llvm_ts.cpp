@@ -1,0 +1,1225 @@
+#include "llvm_ts.h"
+#include "llvm.h"
+#include "log.h"
+#include "var.h"
+#include "common.h"
+#include "profile.h"
+#include "util.h"
+#include "llvm_red.h"
+#include "llvm_gemm.h"
+
+/// Helper function: enqueue parallel CPU task (synchronous or asynchronous)
+template <typename Func>
+static void submit_cpu(KernelType type, KernelRecordingMode recording_mode,
+                       Func &&func, uint32_t width, uint32_t size = 1) {
+
+    struct Payload { Func f; };
+    Payload payload{ std::forward<Func>(func) };
+
+    static_assert(std::is_trivially_copyable<Payload>::value &&
+                  std::is_trivially_destructible<Payload>::value, "Internal error!");
+
+    Task *new_task = task_submit_dep(
+        nullptr, &jitc_task, 1, size,
+        [](uint32_t index, void *payload) { ((Payload *) payload)->f(index); },
+        &payload, sizeof(Payload), nullptr, 0);
+
+    if (unlikely(jit_flag(JitFlag::LaunchBlocking))) {
+        unlock_guard guard(state.lock);
+        task_wait(new_task);
+    }
+
+    if (unlikely(jit_flag(JitFlag::KernelHistory))) {
+        KernelHistoryEntry entry = {};
+        entry.backend = JitBackend::LLVM;
+        entry.type = type;
+        entry.recording_mode = recording_mode;
+        entry.size = width;
+        entry.input_count = 1;
+        entry.output_count = 1;
+        task_retain(new_task);
+        entry.task = new_task;
+        state.kernel_history.append(entry);
+    }
+
+    task_release(jitc_task);
+    jitc_task = new_task;
+}
+
+/// Temporary scratch space for scheduled tasks
+static std::vector<Task *> scheduled_tasks;
+
+void LLVMThreadState::barrier() {
+    // All tasks in 'scheduled_tasks' have 'jitc_task' (if present) as parent.
+    // To create a barrier, we release 'jitc_task' and initialize it with a new
+    // dummy task that has all members of 'scheduled_tasks' as parents. This
+    // allows groups of kernel launches to run in parallel, while serializing
+    // subsequent groups.
+
+    if (scheduled_tasks.size() == 1) {
+        task_release(jitc_task);
+        jitc_task = scheduled_tasks[0];
+    } else {
+        jitc_assert(!scheduled_tasks.empty(),
+                    "jit_eval(): no tasks generated!");
+
+        // Insert a barrier task
+        Task *new_task = task_submit_dep(nullptr, scheduled_tasks.data(),
+                                         (uint32_t) scheduled_tasks.size());
+        task_release(jitc_task);
+        for (Task *t : scheduled_tasks)
+            task_release(t);
+        jitc_task = new_task;
+    }
+    scheduled_tasks.clear();
+
+    if (!free_later.empty())
+        flush_deferred_free();
+}
+
+void LLVMThreadState::flush_deferred_free() {
+    void *batch = take_deferred_free();
+    if (!batch)
+        return;
+
+    if (jitc_task) {
+        Task *new_task = task_submit_dep(
+            nullptr, &jitc_task, 1, /*size=*/1,
+            [](uint32_t, void *p) { jitc_malloc_release_batch(*(void **) p); },
+            &batch, sizeof(void *));
+        task_release(jitc_task);
+        jitc_task = new_task;
+    } else {
+        jitc_malloc_release_batch(batch);
+    }
+}
+
+Task *
+LLVMThreadState::launch(Kernel kernel, KernelKey & /*key*/,
+                        XXH128_hash_t /*hash*/, uint32_t size,
+                        std::vector<void *> &kernel_params,
+                        const std::vector<uint32_t> & /*kernel_param_ids*/,
+                        KernelHistoryEntry *kernel_history_entry) {
+    Task *ret_task = nullptr;
+
+    uint32_t packet_size = jitc_llvm_vector_width,
+             desired_block_size = jitc_llvm_block_size,
+             packets = (size + packet_size - 1) / packet_size,
+             cores = pool_size();
+
+    // We really don't know how much computation this kernel performs, and
+    // it's important to benefit from parallelism. The following heuristic
+    // therefore errs on the side of making too many parallel work units
+    // ("blocks").
+    //
+    // The code below implements the following strategy with 3 "regimes":
+    //
+    // 1. If there is very little work to be done, 1 block == 1 SIMD packet.
+    //    As the amount of work increases, add more blocks until we have
+    //    enough of them to give one to each processor.
+    //
+    // 2. As the amount of work further increases, do more work within each
+    //    block until a maximum is reached (16K elements per block by default)
+    //
+    // 3. Now, keep the block size fixed and instead add more blocks. This
+    //    improves load balancing if some of the blocks terminate early.
+
+    uint32_t blocks, block_size;
+    if (cores <= 1) {
+        blocks = 1;
+        block_size = size;
+    } else if (packets <= cores) {
+        blocks = packets;
+        block_size = packet_size;
+    } else if (size <= desired_block_size * cores * 2) {
+        // Create more work items than cores to mitigate latency arising from
+        // slow/preempted worker threads.
+        blocks = 2 * cores;
+        block_size = (packets + blocks - 1) / blocks * packet_size;
+    } else {
+        block_size = desired_block_size;
+        blocks = (size + block_size - 1) / block_size;
+    }
+
+    auto callback = [](uint32_t index, void *ptr) {
+        void **params = (void **) ptr;
+        LLVMKernelFunction kernel = (LLVMKernelFunction) params[0];
+        uint32_t size       = (uint32_t) (uintptr_t) params[1],
+                 block_size = (uint32_t) ((uintptr_t) params[1] >> 32),
+                 start      = index * block_size,
+                 thread_id  = pool_thread_id(),
+                 end        = std::min(start + block_size, size);
+
+        if (start >= end)
+            return;
+
+#if defined(DRJIT_ENABLE_ITTNOTIFY)
+        // Signal start of kernel
+        __itt_task_begin(drjit_domain, __itt_null, __itt_null,
+                         (__itt_string_handle *) params[2]);
+#endif
+        // Perform the main computation
+        kernel(start, end, thread_id, params);
+
+#if defined(DRJIT_ENABLE_ITTNOTIFY)
+        // Signal termination of kernel
+        __itt_task_end(drjit_domain);
+#endif
+    };
+
+    kernel_params[0] = (void *) kernel.llvm.reloc[0];
+    kernel_params[1] = (void *) ((((uintptr_t) block_size) << 32) +
+                                 (uintptr_t) size);
+
+#if defined(DRJIT_ENABLE_ITTNOTIFY)
+    kernel_params[2] = kernel.llvm.itt;
+#endif
+
+    jitc_trace("jit_run(): launching %u %u-wide packet%s in %u block%s of size %u ..",
+               packets, packet_size, packets == 1 ? "" : "s", blocks,
+               blocks == 1 ? "" : "s", block_size);
+
+    ret_task = task_submit_dep(
+        nullptr, &jitc_task, 1, blocks,
+        callback, kernel_params.data(),
+        (uint32_t) (kernel_params.size() * sizeof(void *)),
+        nullptr
+    );
+
+    if (unlikely(jit_flag(JitFlag::LaunchBlocking)))
+        task_wait(ret_task);
+
+    scheduled_tasks.push_back(ret_task);
+
+    if (kernel_history_entry) {
+        task_retain(ret_task);
+        kernel_history_entry->task = ret_task;
+        state.kernel_history.append(*kernel_history_entry);
+    }
+
+    return ret_task;
+}
+
+void LLVMThreadState::memset_async(void *ptr, uint32_t size_, uint32_t isize,
+                                   const void *src){
+    if (isize != 1 && isize != 2 && isize != 4 && isize != 8)
+        jitc_raise("jit_memset_async(): invalid element size (must be 1, 2, 4, or 8)!");
+
+    jitc_trace("jit_memset_async(" DRJIT_PTR ", isize=%u, size=%u)",
+              (uintptr_t) ptr, isize, size_);
+
+    if (size_ == 0)
+        return;
+
+    size_t size = size_;
+
+    // Try to convert into ordinary memset if possible
+    uint64_t zero = 0;
+    if (memcmp(src, &zero, isize) == 0) {
+        size *= isize;
+        isize = 1;
+    }
+
+
+    // LLVM Specific
+    uint8_t src8[8] { };
+    std::memcpy(&src8, src, isize);
+
+    submit_cpu(KernelType::Memset, this->recording_mode,
+        [ptr, src8, size, isize](uint32_t) {
+            switch (isize) {
+                case 1:
+                    memset(ptr, src8[0], size);
+                    break;
+
+                case 2: {
+                        uint16_t value = ((uint16_t *) src8)[0],
+                                *p = (uint16_t *) ptr;
+                        for (uint32_t i = 0; i < size; ++i)
+                            p[i] = value;
+                    }
+                    break;
+
+                case 4: {
+                        uint32_t value = ((uint32_t *) src8)[0],
+                                *p = (uint32_t *) ptr;
+                        for (uint32_t i = 0; i < size; ++i)
+                            p[i] = value;
+                    }
+                    break;
+
+                case 8: {
+                        uint64_t value = ((uint64_t *) src8)[0],
+                                *p = (uint64_t *) ptr;
+                        for (uint32_t i = 0; i < size; ++i)
+                            p[i] = value;
+                    }
+                    break;
+            }
+        },
+
+        (uint32_t) size
+    );
+}
+
+void LLVMThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
+                                   uint32_t block_size, const void *in,
+                                   void *out) {
+    uint32_t tsize = type_size[(int) vt];
+    if (size == 0) {
+        return;
+    } else if (block_size == 0 || block_size > size) {
+        jitc_raise(
+            "jit_block_reduce(): invalid block size (size=%u, block_size=%u)!",
+            size, block_size);
+    } else if (block_size == 1) {
+        memcpy_async(out, in, size * (size_t) tsize);
+        return;
+    }
+
+    // Get the size of the thread pool to inform the decisions below
+    uint32_t workers = pool_size();
+
+    // How many blocks are there to reduce?
+    // Note: 'size' is not necessary divisible by 'block_size'.
+    uint32_t block_count = ceil_div(size, block_size);
+
+    // Ideally, parallelize over 'ideal_size'-length regions
+    uint32_t ideal_size = jitc_llvm_block_size;
+
+    // The kernel can split each block into smaller chunks to help with this
+    uint32_t chunk_size = block_size;
+    if (chunk_size > 2 * ideal_size && block_count < 2 * workers)
+        chunk_size = ideal_size;
+
+    // How many chunks in total need to be processed?
+    uint32_t chunks_per_block = ceil_div(block_size, chunk_size),
+             chunk_count = block_count * chunks_per_block;
+
+    // Split chunks into work units for the parallelization layer
+    uint32_t work_units, work_unit_size;
+    if (workers > 1) {
+        // Do multiple chunks per work unit if they are smaller than 'ideal_size'
+        work_unit_size = std::min(ceil_div(ideal_size, chunk_size), chunk_count);
+        work_units     = ceil_div(chunk_count, work_unit_size);
+    } else {
+        work_unit_size = chunk_count;
+        work_units = 1;
+    }
+
+    BlockReduction red = create_block_reduction(vt, op);
+
+    void *buf = out;
+    if (chunks_per_block > 1) {
+        buf = jitc_malloc(JitBackend::LLVM, tsize * chunk_count);
+
+        jitc_log(Debug,
+                 "jit_block_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+                 ", type=%s, op=%s, size=%u, block_size=%u, block_count=%u): "
+                 "launching %u work unit%s, each processing %u chunk%s (%u "
+                 "chunks/block). ",
+                 (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+                 red_name[(int) op], size, block_size, block_count, work_units,
+                 work_units > 1 ? "s" : "", work_unit_size,
+                 work_unit_size > 1 ? "" : "", chunks_per_block);
+    } else {
+        jitc_log(Debug,
+                 "jit_block_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+                 ", type=%s, op=%s, size=%u, block_size=%u, block_count=%u): "
+                 "launching %u work unit%s, each processing %u block%s.",
+                 (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+                 red_name[(int) op], size, block_size, block_count, work_units,
+                 work_units > 1 ? "s" : "", work_unit_size,
+                 work_unit_size > 1 ? "s" : "");
+    }
+
+    submit_cpu(
+        KernelType::BlockReduce,
+        this->recording_mode,
+        [red, work_unit_size, size, block_size, chunk_size, chunk_count, chunks_per_block, in, buf](uint32_t index) {
+            red(index, work_unit_size, size, block_size, chunk_size, chunk_count, chunks_per_block, in, buf);
+        },
+        size, work_units
+    );
+
+    if (chunks_per_block > 1) {
+        // Multiple chunks per block, we require an additional reduction
+        block_reduce(vt, op, chunk_count, chunks_per_block, buf, out);
+        jitc_free(buf);
+    }
+}
+
+void LLVMThreadState::block_prefix_reduce(VarType vt, ReduceOp op,
+                                          uint32_t size, uint32_t block_size,
+                                          bool exclusive, bool reverse,
+                                          const void *in, void *out) {
+    uint32_t tsize = type_size[(int) vt];
+    if (size == 0) {
+        return;
+    } else if (block_size == 0 || block_size > size) {
+        jitc_raise(
+            "jit_block_prefix_reduce(): invalid block size (size=%u, block_size=%u)!",
+            size, block_size);
+    } else if (block_size == 1) {
+        if (exclusive) {
+            uint64_t ident = jitc_reduce_identity(vt, op);
+            memset_async(out, size, tsize, &ident);
+        } else if (in != out) {
+            memcpy_async(out, in, size * tsize);
+        }
+        return;
+    }
+
+    // Get the size of the thread pool to inform the decisions below
+    uint32_t workers = pool_size();
+
+    // How many blocks are there to reduce?
+    // Note: 'size' is not necessary divisible by 'block_size'.
+    uint32_t block_count = ceil_div(size, block_size);
+
+    // Ideally, parallelize over 'ideal_size'-length regions
+    uint32_t ideal_size = jitc_llvm_block_size;
+
+    // The kernel can split each block into smaller chunks to help with this
+    uint32_t chunk_size = block_size;
+    if (chunk_size > 2 * ideal_size && block_count < 2 * workers)
+        chunk_size = ideal_size;
+
+    // How many chunks in total need to be processed?
+    uint32_t chunks_per_block = ceil_div(block_size, chunk_size),
+             chunk_count = block_count * chunks_per_block;
+
+    // Split chunks into work units for the parallelization layer
+    uint32_t work_units, work_unit_size;
+    if (workers > 1) {
+        // Do multiple chunks per work unit if they are smaller than 'ideal_size'
+        work_unit_size = std::min(ceil_div(ideal_size, chunk_size), chunk_count);
+        work_units     = ceil_div(chunk_count, work_unit_size);
+    } else {
+        work_unit_size = chunk_count;
+        work_units = 1;
+    }
+
+    BlockReduction red_1 = create_block_reduction(vt, op);
+    BlockPrefixReduction red_2 = create_block_prefix_reduction(vt, op);
+
+    void *scratch = nullptr;
+    if (chunks_per_block > 1) {
+        scratch = jitc_malloc(JitBackend::LLVM, tsize * chunk_count);
+
+        // Launch a block_reduce within block_prefix_reduce. We need to access to its
+        // intermediate state, which is why the kernel is called directly here
+        jitc_log(Debug,
+                 "jit_block_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+                 ", type=%s, op=%s, size=%u, block_size=%u, block_count=%u): "
+                 "launching %u work unit%s, each processing %u chunk%s (%u "
+                 "chunks/block). ",
+                 (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+                 red_name[(int) op], size, block_size, block_count, work_units,
+                 work_units > 1 ? "s" : "", work_unit_size,
+                 work_unit_size > 1 ? "" : "", chunks_per_block);
+
+        submit_cpu(
+            KernelType::BlockPrefixReduce,
+            this->recording_mode,
+            [red_1, work_unit_size, size, block_size, chunk_size, chunk_count,
+             chunks_per_block, in, scratch](uint32_t index) {
+                red_1(index, work_unit_size, size, block_size, chunk_size,
+                      chunk_count, chunks_per_block, in, scratch);
+            },
+            size, work_units);
+
+        block_prefix_reduce(vt, op, chunk_count, chunks_per_block, true,
+                            reverse, scratch, scratch);
+    }
+
+    jitc_log(Debug,
+             "jit_block_prefix_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+             ", type=%s, op=%s, size=%u, block_size=%u, block_count=%u, "
+             "exclusive=%i, reverse=%i): launching %u work unit%s, each "
+             "processing %u block%s.",
+             (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+             red_name[(int) op], size, block_size, block_count, exclusive,
+             reverse, work_units, work_units > 1 ? "s" : "", work_unit_size,
+             work_unit_size > 1 ? "s" : "");
+
+    submit_cpu(
+        KernelType::BlockPrefixReduce,
+        this->recording_mode,
+        [red_2, work_unit_size, size, block_size, chunk_size, chunk_count,
+         chunks_per_block, exclusive, reverse, in, scratch,
+         out](uint32_t index) {
+            red_2(index, work_unit_size, size, block_size, chunk_size,
+                  chunk_count, chunks_per_block, exclusive, reverse, in,
+                  scratch, out);
+        },
+        size, work_units);
+
+    if (chunks_per_block > 1)
+        jitc_free(scratch);
+}
+
+void LLVMThreadState::poke(void *dst, const void *src, uint32_t size) {
+    jitc_log(Debug, "jit_poke(" DRJIT_PTR ", size=%u)", (uintptr_t) dst, size);
+
+    uint8_t src8[8] { };
+    std::memcpy(&src8, src, size);
+
+    submit_cpu(
+        KernelType::Poke,
+        this->recording_mode,
+        [src8, size, dst](uint32_t) {
+            std::memcpy(dst, &src8, size);
+        },
+
+        size
+    );
+}
+
+void LLVMThreadState::reduce_dot(VarType type, const void *ptr_1,
+                                 const void *ptr_2,
+                                 uint32_t size, void *out) {
+
+    jitc_log(Debug, "jit_reduce_dot(" DRJIT_PTR ", " DRJIT_PTR ", type=%s, size=%u)",
+             (uintptr_t) ptr_1, (uintptr_t) ptr_2, type_name[(int) type],
+             size);
+
+    uint32_t tsize = type_size[(int) type];
+
+    uint32_t block_size = size, blocks = 1;
+    if (pool_size() > 1) {
+        block_size = jitc_llvm_block_size;
+        blocks     = (size + block_size - 1) / block_size;
+    }
+
+    void *target = out;
+    if (blocks > 1)
+        target = jitc_malloc(JitBackend::LLVM, blocks * tsize);
+
+    Reduction2 reduction = jitc_reduce_dot_create(type);
+    submit_cpu(
+        KernelType::Dot,
+        this->recording_mode,
+        [block_size, size, tsize, ptr_1, ptr_2, reduction, target](uint32_t index) {
+            reduction(ptr_1, ptr_2, index * block_size,
+                      std::min((index + 1) * block_size, size),
+                      (uint8_t *) target + index * tsize);
+        },
+
+        size,
+        std::max(1u, blocks));
+
+    if (blocks > 1) {
+        block_reduce(type, ReduceOp::Add, blocks, blocks, target, out);
+        jitc_free(target);
+    }
+}
+
+// Slice the reduce-dim portion of a ``GemmBatch``. The returned
+// struct holds pointers into ``be`` and stays valid for the lifetime
+// of ``be``.
+static inline GemmReduce gemm_reduce_slice(const GemmBatch &be,
+                                           uint32_t r_count) {
+    return { r_count, be.n_rdims, be.extent + be.n_bdims,
+             be.a_stride + be.n_bdims, be.b_stride + be.n_bdims };
+}
+
+void LLVMThreadState::batched_gemm(VarType vt, bool At, bool Bt, uint32_t M,
+                                   uint32_t N, uint32_t K, const GemmBatch *batch,
+                                   const void *A, const void *B, void *C) {
+    // The kernels below do not handle ``At == Bt == true``; the Python
+    // caller reduces that case to a single-transpose call via
+    // ``A^T @ B^T = (B @ A)^T`` before reaching this point.
+    if (At && Bt)
+        jitc_raise("jit_batched_gemm(): internal error -- At=Bt=True "
+                   "should have been rewritten by the caller.");
+
+    GemmDispatch d = gemm_dispatch(vt, At, Bt);
+
+    uint32_t grid_count, reduce_count;
+    if (!jitc_gemm_batch_counts(batch, grid_count, reduce_count))
+        return;
+    if (M == 0 || N == 0)
+        return;
+
+    GemmBatch batch_eff = batch ? *batch : GemmBatch{};
+    uint32_t tsize = type_size[(int) vt];
+    size_t c_batch_stride = (size_t) M * N;
+
+    const uint32_t MR = d.MR;
+    const uint32_t NR = d.NR;
+    const uint32_t KC = GEMM_KC;
+    const uint32_t acc_size = d.acc_size;
+
+    // Slab counts include any trailing partial slab — zero-padding in
+    // the pack step lets the microkernel run on every tile without a
+    // separate edge path.
+    const uint32_t row_slabs = (M + MR - 1) / MR;
+    const uint32_t col_slabs = (N + NR - 1) / NR;
+
+    // ``NC`` caps the column-panel width in the shared ``packed_B``
+    // buffer (always a multiple of NR). Rounding up keeps the
+    // trailing panel fitting even when ``N`` is not a multiple of NR.
+    const uint32_t NC = std::min<uint32_t>(col_slabs, (GEMM_NC + NR - 1) / NR) * NR;
+
+    jitc_log(Debug,
+             "jit_batched_gemm(" DRJIT_PTR ", " DRJIT_PTR " -> " DRJIT_PTR
+             ", type=%s, At=%i, Bt=%i, M=%u, N=%u, K=%u, grid=%u, "
+             "reduce=%u, MRxNR=%ux%u, KC=%u, NC=%u).",
+             (uintptr_t) A, (uintptr_t) B, (uintptr_t) C,
+             type_name[(int) vt], (int) At, (int) Bt, M, N, K, grid_count,
+             reduce_count, MR, NR, KC, NC);
+
+    // Degenerate K == 0: output is the zero matrix.
+    if (K == 0) {
+        size_t n_bytes = (size_t) grid_count * M * N * tsize;
+        submit_cpu(
+            KernelType::BatchedGemm, this->recording_mode,
+            [C, n_bytes](uint32_t) { memset(C, 0, n_bytes); },
+            (uint32_t) std::min<size_t>(n_bytes, UINT32_MAX), 1);
+        return;
+    }
+
+    // One shared ``packed_B`` scratch holds a ``KC x NC`` column
+    // panel (including tail padding); every (grid, reduce, jc, pc)
+    // iteration reuses it. ``jitc_free`` on HostAsync memory defers
+    // until the submitted tasks complete.
+    size_t pb_bytes = (size_t) KC * NC * acc_size;
+    void *packed_B = jitc_malloc(JitBackend::LLVM, pb_bytes);
+
+    // Half inputs reduce in float. The float ``C_scratch`` holds
+    // partial sums between task dispatches, so it is only needed when
+    // the reduction spans multiple dispatches (``K > KC`` or
+    // ``reduce_count > 1``). A single-pass reduction keeps its float
+    // accumulator on the worker's stack and narrows straight into
+    // the user's ``C``; the kernel is passed a null ``C_b`` and
+    // never dereferences it.
+    const bool widen_c = acc_size != tsize;
+    const bool needs_c_scratch = widen_c && (K > KC || reduce_count > 1);
+    void *C_scratch = needs_c_scratch
+        ? jitc_malloc(JitBackend::LLVM, (size_t) M * N * acc_size)
+        : nullptr;
+
+    const uint32_t cores = pool_size();
+
+    for (uint32_t b = 0; b < grid_count; ++b) {
+        // Decode grid index into per-operand byte offsets for A / B.
+        size_t a_off = 0, b_off = 0;
+        {
+            uint32_t z = b;
+            for (uint32_t dim = 0; dim < batch_eff.n_bdims; ++dim) {
+                uint32_t idx = z % batch_eff.extent[dim];
+                z /= batch_eff.extent[dim];
+                a_off += (size_t) idx * batch_eff.a_stride[dim];
+                b_off += (size_t) idx * batch_eff.b_stride[dim];
+            }
+        }
+        const void *A_b = (const uint8_t *) A + a_off * tsize;
+        const void *B_b = (const uint8_t *) B + b_off * tsize;
+        void *C_b_final = (uint8_t *) C + (size_t) b * c_batch_stride * tsize;
+        // Kernel target for partial sums: the float scratch for the
+        // multi-pass half case (reused across grid elements since
+        // ``first=(rb==0 && pc==0)`` zero-inits the tile), ``nullptr``
+        // for the single-pass half case (the kernel keeps the float
+        // accumulator on the stack), and ``C`` itself otherwise.
+        void *C_b = widen_c ? C_scratch : C_b_final;
+
+        // Phase 2 shards over both row slabs and column chunks so
+        // small-M shapes still keep every core busy. With ``jc``
+        // outermost, the last ``(rb, pc)`` pass of each panel is
+        // the tile's final write, which the widen path narrows
+        // directly into ``C_b_final``.
+        GemmReduce reduce_base = gemm_reduce_slice(batch_eff, reduce_count);
+
+        for (uint32_t jc = 0; jc < N; jc += NC) {
+            const uint32_t n_panel = std::min(NC, N - jc);
+            const uint32_t panel_slabs = (n_panel + NR - 1) / NR;
+            const uint32_t panel_tail  = n_panel % NR;
+
+            const uint32_t j_chunks = std::min(
+                panel_slabs, (cores + row_slabs - 1) / row_slabs);
+            const uint32_t chunk_slabs =
+                (panel_slabs + j_chunks - 1) / j_chunks;
+
+            for (uint32_t rb = 0; rb < reduce_count; ++rb) {
+                size_t ra_off = 0, rb_off = 0;
+                gemm_reduce_decode(reduce_base, rb, ra_off, rb_off);
+                const void *A_r = (const uint8_t *) A_b + ra_off * tsize;
+                const void *B_r = (const uint8_t *) B_b + rb_off * tsize;
+                const bool last_rb = (rb + 1 == reduce_count);
+
+                for (uint32_t pc = 0; pc < K; pc += KC) {
+                    const uint32_t kc_len = std::min(KC, K - pc);
+                    const bool first = (rb == 0 && pc == 0);
+                    const bool last_pc = (pc + kc_len == K);
+                    const bool narrow_store = widen_c && last_rb && last_pc;
+
+                    // Phase 1: parallel pack of B slabs into packed_B.
+                    GemmPackBFn fn_pack_b = d.pack_b;
+                    submit_cpu(
+                        KernelType::BatchedGemm, this->recording_mode,
+                        [fn_pack_b, B_r, packed_B, N, K, jc, pc, kc_len,
+                         NR, acc_size, panel_slabs, panel_tail](uint32_t idx) {
+                            uint32_t n_valid = (panel_tail > 0 && idx == panel_slabs - 1)
+                                                   ? panel_tail : NR;
+                            void *slab = (uint8_t *) packed_B +
+                                         (size_t) idx * GEMM_KC * NR * acc_size;
+                            fn_pack_b(B_r, slab, N, K,
+                                      jc + idx * NR, pc, kc_len, n_valid);
+                        },
+                        panel_slabs * kc_len * NR, panel_slabs);
+
+                    // Phase 2: parallel microtile-row sweep, sharded
+                    // over ``(row_slab, col_chunk)``. Empty tail
+                    // chunks (``s_lo >= s_hi``) short-circuit out.
+                    GemmRowSweepFn fn_row = d.row_sweep;
+                    submit_cpu(
+                        KernelType::BatchedGemm, this->recording_mode,
+                        [fn_row, A_r, packed_B, C_b, C_b_final, M, N, K,
+                         jc, pc, kc_len, panel_slabs, panel_tail,
+                         chunk_slabs, j_chunks, first, narrow_store, MR]
+                        (uint32_t idx) {
+                            uint32_t r = idx / j_chunks;
+                            uint32_t c = idx % j_chunks;
+                            uint32_t s_lo = c * chunk_slabs;
+                            uint32_t s_hi = std::min(s_lo + chunk_slabs,
+                                                     panel_slabs);
+                            if (s_lo >= s_hi)
+                                return;
+                            fn_row(A_r, packed_B, C_b, C_b_final, M, N, K,
+                                   r * MR, jc, pc, kc_len,
+                                   panel_slabs, panel_tail,
+                                   s_lo, s_hi, first, narrow_store);
+                        },
+                        row_slabs * panel_slabs * MR * NR,
+                        row_slabs * j_chunks);
+                }
+            }
+        }
+    }
+
+    jitc_free(packed_B);
+    if (needs_c_scratch)
+        jitc_free(C_scratch);
+}
+
+uint32_t LLVMThreadState::compress(const uint8_t *in, uint32_t size,
+                                   uint32_t *out) {
+    if (size == 0)
+        return 0;
+
+    uint32_t block_size = size, blocks = 1;
+    if (pool_size() > 1) {
+        block_size = jitc_llvm_block_size;
+        blocks     = (size + block_size - 1) / block_size;
+    }
+
+    uint32_t count_out = 0;
+
+    jitc_log(Debug,
+            "jit_compress(" DRJIT_PTR " -> " DRJIT_PTR
+            ", size=%u, block_size=%u, blocks=%u)",
+            (uintptr_t) in, (uintptr_t) out, size, block_size, blocks);
+
+    uint32_t *scratch = nullptr;
+
+    if (blocks > 1) {
+        scratch = (uint32_t *) jitc_malloc(JitBackend::LLVM,
+                                           blocks * sizeof(uint32_t));
+
+        submit_cpu(
+            KernelType::Compress,
+            this->recording_mode,
+            [block_size, size, in, scratch](uint32_t index) {
+                uint32_t start = index * block_size,
+                         end = std::min(start + block_size, size);
+
+                uint32_t accum = 0;
+                for (uint32_t i = start; i != end; ++i)
+                    accum += (uint32_t) in[i];
+
+                scratch[index] = accum;
+            },
+
+            size, blocks
+        );
+
+        block_prefix_reduce(VarType::UInt32, ReduceOp::Add, blocks,
+                            blocks, true, false, scratch, scratch);
+    }
+
+    submit_cpu(
+        KernelType::Compress,
+        this->recording_mode,
+        [block_size, size, scratch, in, out, &count_out](uint32_t index) {
+            uint32_t start = index * block_size,
+                     end = std::min(start + block_size, size);
+
+            uint32_t accum = 0;
+            if (scratch)
+                accum = scratch[index];
+
+            for (uint32_t i = start; i != end; ++i) {
+                uint32_t value = (uint32_t) in[i];
+                if (value)
+                    out[accum] = i;
+                accum += value;
+            }
+
+            if (end == size)
+                count_out = accum;
+        },
+
+        size, blocks
+    );
+
+    jitc_free(scratch);
+    jitc_sync_thread(this);
+
+    return count_out;
+}
+
+static ProfilerRegion profiler_region_block_mkperm_phase_1("jit_block_mkperm_phase_1");
+static ProfilerRegion profiler_region_block_mkperm_phase_2("jit_block_mkperm_phase_2");
+
+uint32_t LLVMThreadState::block_mkperm(const uint32_t *ptr, uint32_t size,
+                                         uint32_t block_size,
+                                         uint32_t bucket_count, uint32_t *perm,
+                                         uint32_t *offsets) {
+    if (size == 0)
+        return 0;
+    else if (unlikely(bucket_count == 0))
+        jitc_fail("jit_block_mkperm(): bucket_count cannot be zero!");
+
+    // Number of independent sorting groups
+    uint32_t n_blocks = ceil_div(size, block_size);
+
+    // Split each sorting group into CPU tasks for parallelism
+    uint32_t tasks_per_group = 1,
+             task_size = block_size,
+             ps = ::pool_size();
+
+    if (ps > 1) {
+        // Try to spread out uniformly over cores
+        tasks_per_group = ps * 4;
+        task_size = (block_size + tasks_per_group - 1) / tasks_per_group;
+
+        // But don't make the tasks too small
+        task_size = std::max(jitc_llvm_block_size, task_size);
+
+        // Re-adjust task count given the selected task size
+        tasks_per_group = (block_size + task_size - 1) / task_size;
+    }
+
+    uint32_t total_tasks = n_blocks * tasks_per_group;
+
+    jitc_log(Debug,
+            "jit_block_mkperm(" DRJIT_PTR
+            ", size=%u, block_size=%u, bucket_count=%u, n_blocks=%u, "
+            "tasks_per_group=%u)",
+            (uintptr_t) ptr, size, block_size, bucket_count, n_blocks,
+            tasks_per_group);
+
+    uint32_t **buckets =
+        (uint32_t **) jitc_malloc(JitBackend::LLVM,
+                                  sizeof(uint32_t *) * total_tasks);
+
+    uint32_t unique_count = 0;
+
+    // Phase 1: build per-task histograms
+    submit_cpu(
+        KernelType::MkPerm,
+        this->recording_mode,
+        [task_size, block_size, size, buckets, bucket_count, ptr,
+         tasks_per_group](uint32_t index) {
+            ProfilerPhase profiler(profiler_region_block_mkperm_phase_1);
+
+            uint32_t group = index / tasks_per_group;
+            uint32_t task_in_group = index % tasks_per_group;
+            uint32_t group_start = group * block_size;
+            uint32_t start = group_start + task_in_group * task_size;
+            uint32_t end = std::min(start + task_size,
+                           std::min(group_start + block_size, size));
+
+            size_t bsize = sizeof(uint32_t) * (size_t) bucket_count;
+            uint32_t *buckets_local = (uint32_t *) malloc_check(bsize);
+            memset(buckets_local, 0, bsize);
+
+            for (uint32_t i = start; i != end; ++i)
+                buckets_local[ptr[i]]++;
+
+            buckets[index] = buckets_local;
+        },
+
+        size, total_tasks
+    );
+
+    // Accumulation step: prefix sum the per-task histograms within each
+    // sorting group and (optionally) collect non-empty bucket offsets.
+    submit_cpu(
+        KernelType::MkPerm,
+        this->recording_mode,
+        [bucket_count, n_blocks, tasks_per_group, block_size, buckets,
+         offsets, &unique_count](uint32_t) {
+            uint32_t unique_count_local = 0;
+
+            for (uint32_t g = 0; g < n_blocks; ++g) {
+                uint32_t group_offset = 0;
+                bool single_group = (n_blocks == 1);
+                uint32_t group_start = g * block_size;
+
+                for (uint32_t i = 0; i < bucket_count; ++i) {
+                    uint32_t sum_local = 0;
+                    for (uint32_t j = 0; j < tasks_per_group; ++j) {
+                        uint32_t *bl = buckets[g * tasks_per_group + j];
+                        uint32_t value = bl[i];
+                        bl[i] = group_start + group_offset + sum_local;
+                        sum_local += value;
+                    }
+                    if (single_group && sum_local > 0 && offsets) {
+                        offsets[unique_count_local*4] = i;
+                        offsets[unique_count_local*4 + 1] = group_offset;
+                        offsets[unique_count_local*4 + 2] = sum_local;
+                        offsets[unique_count_local*4 + 3] = 0;
+                        unique_count_local++;
+                    }
+                    group_offset += sum_local;
+                }
+            }
+
+            unique_count = unique_count_local;
+        },
+
+        size
+    );
+
+    Task *local_task = jitc_task;
+    task_retain(local_task);
+
+    // Phase 2: write out permutation
+    submit_cpu(
+        KernelType::MkPerm,
+        this->recording_mode,
+        [task_size, block_size, size, buckets, perm, ptr,
+         tasks_per_group](uint32_t index) {
+            ProfilerPhase profiler(profiler_region_block_mkperm_phase_2);
+
+            uint32_t group = index / tasks_per_group;
+            uint32_t task_in_group = index % tasks_per_group;
+            uint32_t group_start = group * block_size;
+            uint32_t start = group_start + task_in_group * task_size;
+            uint32_t end = std::min(start + task_size,
+                           std::min(group_start + block_size, size));
+
+            uint32_t *buckets_local = buckets[index];
+
+            for (uint32_t i = start; i != end; ++i) {
+                uint32_t idx = buckets_local[ptr[i]]++;
+                perm[idx] = i;
+            }
+
+            free(buckets_local);
+        },
+
+        size, total_tasks
+    );
+
+    // Free memory (happens asynchronously after the above stmt.)
+    jitc_free(buckets);
+
+    unlock_guard guard(state.lock);
+    task_wait_and_release(local_task);
+    return unique_count;
+}
+
+void LLVMThreadState::memcpy_async(void *dst, const void *src, size_t size) {
+    submit_cpu(
+        KernelType::Memcpy,
+        this->recording_mode,
+        [dst, src, size](uint32_t) {
+            std::memcpy(dst, src, size);
+        },
+
+        (uint32_t) size
+    );
+}
+
+void LLVMThreadState::memcpy(void *dst, const void *src, size_t size) {
+    memcpy_async(dst, src, size);
+
+    Task *task = jitc_task;
+    task_retain(task);
+    unlock_guard guard(state.lock);
+    task_wait_and_release(task);
+}
+
+void LLVMThreadState::aggregate(void *dst_, AggregationEntry *agg,
+                                uint32_t size) {
+    uint32_t work_unit_size = size, work_units = 1;
+    if (pool_size() > 1) {
+        work_unit_size = jitc_llvm_block_size;
+        work_units     = (size + work_unit_size - 1) / work_unit_size;
+    }
+
+    jitc_log(InfoSym,
+             "jit_aggregate(" DRJIT_PTR " -> " DRJIT_PTR
+             ", size=%u, work_units=%u)",
+             (uintptr_t) agg, (uintptr_t) dst_, size, work_units);
+
+    submit_cpu(
+        KernelType::Aggregate,
+        this->recording_mode,
+        [dst_, agg, size, work_unit_size](uint32_t index) {
+            uint32_t start = index * work_unit_size,
+                     end = std::min(start + work_unit_size, size);
+
+            for (uint32_t i = start; i != end; ++i) {
+                AggregationEntry e = agg[i];
+
+                const void *src = e.src;
+                void *dst = (uint8_t *) dst_ + e.offset;
+
+                switch (e.size) {
+                    case  1: *(uint8_t *)  dst =  (uint8_t)  (uintptr_t) src; break;
+                    case  2: *(uint16_t *) dst =  (uint16_t) (uintptr_t) src; break;
+                    case  4: *(uint32_t *) dst =  (uint32_t) (uintptr_t) src; break;
+                    case  8: *(uint64_t *) dst =  (uint64_t) (uintptr_t) src; break;
+                    case -1: *(uint8_t *)  dst = *(uint8_t *)  src; break;
+                    case -2: *(uint16_t *) dst = *(uint16_t *) src; break;
+                    case -4: *(uint32_t *) dst = *(uint32_t *) src; break;
+                    case -8: *(uint64_t *) dst = *(uint64_t *) src; break;
+                }
+            }
+        },
+        size, work_units);
+}
+
+void LLVMThreadState::enqueue_host_func(void (*callback)(void *),
+                                        void *payload) {
+    if (!jitc_task) {
+        unlock_guard guard(state.lock);
+        callback(payload);
+    } else {
+        submit_cpu(
+            KernelType::LLVMHostFunc, this->recording_mode,
+            [payload, callback](uint32_t) { callback(payload); }, 1, 1);
+    }
+}
+
+using ReduceExpanded = void (*) (void *ptr, uint32_t start, uint32_t end, uint32_t exp, uint32_t size);
+
+template <typename Value, typename Op>
+static void reduce_expanded_impl(void *ptr_, uint32_t start, uint32_t end,
+                                 uint32_t exp, uint32_t size) {
+    Value *ptr = (Value *) ptr_;
+    Op op;
+
+    const uint32_t block = 128;
+
+    uint32_t i = start;
+    for (; i + block <= end; i += block)
+        for (uint32_t j = 1; j < exp; ++j)
+            for (uint32_t k = 0; k < block; ++k)
+                ptr[i + k] = op(ptr[i + k], ptr[i + k + j * size]);
+
+    for (; i < end; i += 1)
+        for (uint32_t j = 1; j < exp; ++j)
+            ptr[i] = op(ptr[i], ptr[i + j * size]);
+}
+
+template <typename Value>
+static ReduceExpanded reduce_expanded_create(ReduceOp op) {
+    using UInt = uint_with_size_t<Value>;
+
+    struct Add { Value operator()(Value a, Value b) JIT_NO_UBSAN { return a + b; }};
+    struct Mul { Value operator()(Value a, Value b) JIT_NO_UBSAN { return a * b; }};
+    struct Min { Value operator()(Value a, Value b) { return std::min(a, b); }};
+    struct Max { Value operator()(Value a, Value b) { return std::max(a, b); }};
+    struct And {
+        Value operator()(Value a, Value b) {
+            (void) a; (void) b;
+            if constexpr (std::is_integral_v<Value>)
+                return a & b;
+            else
+                return 0;
+        }
+    };
+    struct Or {
+        Value operator()(Value a, Value b) {
+            (void) a; (void) b;
+            if constexpr (std::is_integral_v<Value>)
+                return a | b;
+            else
+                return 0;
+        }
+    };
+
+    switch (op) {
+        case ReduceOp::Add: return reduce_expanded_impl<Value, Add>;
+        case ReduceOp::Mul: return reduce_expanded_impl<Value, Mul>;
+        case ReduceOp::Max: return reduce_expanded_impl<Value, Max>;
+        case ReduceOp::Min: return reduce_expanded_impl<Value, Min>;
+        case ReduceOp::And: return reduce_expanded_impl<Value, And>;
+        case ReduceOp::Or: return reduce_expanded_impl<Value, Or>;
+
+        default: jitc_raise("jit_reduce_expanded_create(): unsupported reduction type!");
+    }
+}
+
+static ReduceExpanded reduce_expanded_create(VarType type, ReduceOp op) {
+    using half = drjit::half;
+    switch (type) {
+        case VarType::Int32:   return reduce_expanded_create<int32_t >(op);
+        case VarType::UInt32:  return reduce_expanded_create<uint32_t>(op);
+        case VarType::Int64:   return reduce_expanded_create<int64_t >(op);
+        case VarType::UInt64:  return reduce_expanded_create<uint64_t>(op);
+        case VarType::Float16: return reduce_expanded_create<half    >(op);
+        case VarType::Float32: return reduce_expanded_create<float   >(op);
+        case VarType::Float64: return reduce_expanded_create<double  >(op);
+        default: jitc_raise("jit_reduce_create(): unsupported data type!");
+    }
+}
+
+void LLVMThreadState::reduce_expanded(VarType vt, ReduceOp op, void *ptr,
+                                      uint32_t exp, uint32_t size) {
+    jitc_log(Debug, "jit_reduce_expanded(" DRJIT_PTR ", type=%s, op=%s, expfactor=%u, size=%u)",
+            (uintptr_t) ptr, type_name[(int) vt],
+            red_name[(int) op], exp, size);
+
+    ReduceExpanded kernel = reduce_expanded_create(vt, op);
+
+    uint32_t block_size = size, blocks = 1;
+    if (pool_size() > 1) {
+        block_size = jitc_llvm_block_size;
+        blocks     = (size + block_size - 1) / block_size;
+    }
+
+    submit_cpu(
+        KernelType::BlockReduce,
+        this->recording_mode,
+        [ptr, block_size, exp, size, kernel](uint32_t index) {
+            kernel(ptr, index * block_size,
+                   std::min((index + 1) * block_size, size), exp, size);
+        },
+
+        size, std::max(1u, blocks));
+}
+
+void LLVMThreadState::coop_vec_pack(uint32_t count, const void *in,
+                                    const MatrixDescr *in_d, void *out,
+                                    const MatrixDescr *out_d) {
+    struct PackTask {
+        drjit::unique_ptr<MatrixDescr[]> in_d, out_d;
+        const uint8_t *in;
+        uint8_t *out;
+
+        void run(uint32_t index) {
+            const MatrixDescr &id = in_d[index], &od = out_d[index];
+            uint32_t tsize = type_size[(int) id.dtype];
+
+            if (id.stride == id.cols && od.stride == od.cols) {
+                std::memcpy(
+                    out + od.offset*tsize,
+                    in + id.offset*tsize,
+                    id.size * tsize
+                );
+            } else {
+                for (uint32_t j = 0; j < id.rows; ++j) {
+                    std::memcpy(
+                           out + (od.offset + j * od.stride)*tsize,
+                           in + (id.offset + j * id.stride)*tsize,
+                           id.cols * tsize);
+                }
+            }
+        }
+    };
+
+    drjit::unique_ptr<PackTask> task = new PackTask();
+    task->in_d = new MatrixDescr[count];
+    task->out_d = new MatrixDescr[count];
+    task->in = (const uint8_t *) in;
+    task->out = (uint8_t *) out;
+    std::memcpy(task->in_d.get(), in_d, count * sizeof(MatrixDescr));
+    std::memcpy(task->out_d.get(), out_d, count * sizeof(MatrixDescr));
+
+    Task *new_task = task_submit_dep(
+        nullptr, &jitc_task, 1, count,
+        [](uint32_t index, void *p) {
+            ((PackTask *) p)->run(index);
+        },
+        task.release(),
+        sizeof(void *),
+        [](void *p) {
+            delete (PackTask *) p;
+        },
+        0
+    );
+
+    task_release(jitc_task);
+    jitc_task = new_task;
+}
+
+// ====================================================================
+//                       Event API implementation
+// ====================================================================
+
+JitEvent jitc_llvm_event_create(bool enable_timing) {
+    EventData* event = new EventData(JitBackend::LLVM, enable_timing);
+    event->ts = thread_state(JitBackend::LLVM);
+    return (JitEvent)event;
+}
+
+void jitc_llvm_event_destroy(JitEvent event) {
+    EventData* e = (EventData*)event;
+    if (e->llvm_task)
+        task_release(e->llvm_task);
+    delete e;
+}
+
+void jitc_llvm_event_record(JitEvent event) {
+    EventData* e = (EventData*)event;
+
+    if (e->llvm_task) {
+        task_release(e->llvm_task);
+        e->llvm_task = nullptr;
+    }
+
+    // Create a minimal task that depends on current work
+    e->llvm_task = task_submit_dep(
+        nullptr, &jitc_task, jitc_task ? 1 : 0,
+        1,        // size = 1 (minimally sized work unit)
+        nullptr,  // func = nullptr (no actual work)
+        nullptr,  // payload
+        0,        // payload_size
+        nullptr,  // payload_deleter
+        1,        // always_async = 1 (never execute locally)
+        e->enable_timing ? 1 : 0  // profile = 1 if timing is enabled
+    );
+}
+
+int jitc_llvm_event_query(JitEvent event) {
+    EventData* e = (EventData*)event;
+    return task_query(e->llvm_task);
+}
+
+void jitc_llvm_event_wait(JitEvent event) {
+    EventData* e = (EventData*)event;
+    task_wait(e->llvm_task);
+}
+
+float jitc_llvm_event_elapsed_time(JitEvent start, JitEvent end) {
+    EventData* s = (EventData*)start;
+    EventData* e = (EventData*)end;
+
+    if (!s->enable_timing || !e->enable_timing)
+        jitc_raise("jit_event_elapsed_time(): both events must have timing enabled");
+
+    if (!s->llvm_task || !e->llvm_task)
+        jitc_raise("jit_event_elapsed_time(): events must be recorded");
+
+    // Ensure both tasks are complete
+    task_wait(s->llvm_task);
+    task_wait(e->llvm_task);
+
+    return (float) task_time_rel(s->llvm_task, e->llvm_task);
+}

@@ -1,0 +1,117 @@
+/*
+    src/util.h -- Parallel reductions and miscellaneous utility routines.
+
+    Copyright (c) 2021 Wenzel Jakob <wenzel.jakob@epfl.ch>
+
+    All rights reserved. Use of this source code is governed by a BSD-style
+    license that can be found in the LICENSE file.
+*/
+
+#pragma once
+
+#include <drjit-core/jit.h>
+#include "cuda.h"
+
+/// Descriptive names for the various reduction operations
+extern const char *red_name[(int) ReduceOp::Count];
+
+/// Fill a device memory region with constants of a given type
+extern void jitc_memset_async(JitBackend backend, void *ptr, uint32_t size,
+                              uint32_t isize, const void *src);
+
+/// Reduce the given array to a single value
+extern void jitc_reduce(JitBackend backend, VarType type, ReduceOp op,
+                        uint32_t size, const void *in, void *out);
+
+/// Reduce elements within blocks
+extern void jitc_block_reduce(JitBackend backend, VarType type, ReduceOp op,
+                              uint32_t size, uint32_t block_size, const void *in,
+                              void *out);
+
+/// Implements various kinds of blocked prefix reductions
+extern void jitc_block_prefix_reduce(JitBackend backend, VarType type,
+                                     ReduceOp op, uint32_t block_size,
+                                     uint32_t size, bool exclusive,
+                                     bool reverse, const void *in,
+                                     void *out);
+
+/// Dot product reduction
+extern void jitc_reduce_dot(JitBackend backend, VarType type,
+                            const void *ptr_1, const void *ptr_2,
+                            uint32_t size, void *out);
+
+/// Matrix multiplication: ``C = op_A(A) @ op_B(B)`` for row-major
+/// (C-contiguous) matrices with optional per-operand transposes. The
+/// optional ``batch`` argument selects between a single GEMM
+/// (``batch == nullptr || batch->n_bdims == 0``) and a batched GEMM
+/// with independent per-operand broadcasting along each batch dim.
+extern void jitc_batched_gemm(JitBackend backend, VarType type, bool At, bool Bt,
+                        uint32_t M, uint32_t N, uint32_t K,
+                        const GemmBatch *batch,
+                        const void *A, const void *B, void *C);
+
+/// Compute the grid and reduce dimension products of a GemmBatch.
+/// ``batch == nullptr`` collapses to (1, 1). Returns ``false`` if any
+/// extent is zero, allowing callers to short-circuit on empty batches.
+inline bool jitc_gemm_batch_counts(const GemmBatch *batch,
+                                   uint32_t &grid_count,
+                                   uint32_t &reduce_count) {
+    grid_count = 1;
+    reduce_count = 1;
+    if (!batch)
+        return true;
+    for (uint32_t d = 0; d < batch->n_bdims; ++d) {
+        if (batch->extent[d] == 0)
+            return false;
+        grid_count *= batch->extent[d];
+    }
+    for (uint32_t d = 0; d < batch->n_rdims; ++d) {
+        uint32_t dd = batch->n_bdims + d;
+        if (batch->extent[dd] == 0)
+            return false;
+        reduce_count *= batch->extent[dd];
+    }
+    return true;
+}
+
+/// 'All' reduction for boolean arrays (synchronous)
+extern bool jitc_all(JitBackend backend, uint8_t *values, uint32_t size);
+
+/// 'All' reduction for boolean arrays (asynchronous)
+extern void jitc_all_async(JitBackend backend, uint8_t *values, uint32_t size, uint8_t *out);
+
+/// 'Any' reduction for boolean arrays (synchronous)
+extern bool jitc_any(JitBackend backend, uint8_t *values, uint32_t size);
+
+/// 'Any' reduction for boolean arrays (asynchronous)
+extern void jitc_any_async(JitBackend backend, uint8_t *values, uint32_t size, uint8_t *out);
+
+/// Mask compression
+extern uint32_t jitc_compress(JitBackend backend, const uint8_t *in, uint32_t size,
+                              uint32_t *out);
+
+/// Compute a permutation to reorder an integer array into discrete groups
+extern uint32_t jitc_block_mkperm(JitBackend backend, const uint32_t *values,
+                                    uint32_t size, uint32_t block_size,
+                                    uint32_t bucket_count, uint32_t *perm,
+                                    uint32_t *offsets);
+
+/// Perform a synchronous copy operation
+extern void jitc_memcpy(JitBackend backend, void *dst, const void *src, size_t size);
+
+/// Perform an asynchronous copy operation
+extern void jitc_memcpy_async(JitBackend backend, void *dst, const void *src, size_t size);
+
+/// Asynchronously update a single element in memory
+extern void jitc_poke(JitBackend backend, void *dst, const void *src, uint32_t size);
+
+extern void jitc_aggregate(JitBackend backend, void *dst,
+                           AggregationEntry *agg, uint32_t size);
+
+// Enqueue a function to be run on the host once backend computation is done
+extern void jitc_enqueue_host_func(JitBackend backend, void (*callback)(void *),
+                                   void *payload);
+
+/// LLVM: reduce a variable that was previously expanded due to dr.ReduceOp.Expand
+extern void jitc_reduce_expanded(VarType vt, ReduceOp op, void *data,
+                                 uint32_t exp, uint32_t size);

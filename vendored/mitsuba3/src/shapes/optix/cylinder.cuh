@@ -1,0 +1,52 @@
+#pragma once
+
+#include <math.h>
+#include <mitsuba/render/optix/common.h>
+#include <mitsuba/render/optix/math.cuh>
+#include <mitsuba/render/shapedata.h>
+
+#ifdef __CUDACC__
+extern "C" __global__ void __intersection__cylinder() {
+    const OptixHitGroupData *sbt_data = (OptixHitGroupData*) optixGetSbtDataPointer();
+    shapedata::CylinderData *cylinder = (shapedata::CylinderData *)sbt_data->data;
+    float length = cylinder->params.x, radius = cylinder->params.y;
+
+    // Ray in intance-space
+    Ray3f ray = get_ray();
+    // Ray in object-space
+    ray = apply_affine_ray(cylinder->to_object, ray);
+
+    float ox = ray.o.x(),
+          oy = ray.o.y(),
+          oz = ray.o.z(),
+          dx = ray.d.x(),
+          dy = ray.d.y(),
+          dz = ray.d.z();
+
+    float A = sqr(dx) + sqr(dy),
+          B = 2.0 * (dx * ox + dy * oy),
+          C = sqr(ox) + sqr(oy) - sqr(radius);
+
+    float near_t, far_t;
+    bool solution_found = solve_quadratic(A, B, C, near_t, far_t);
+
+    // Cylinder doesn't intersect with the segment on the ray
+    bool out_bounds = !(near_t <= ray.maxt && far_t >= ray.mint); // NaN-aware conditionals
+
+    float z_pos_near = oz + dz * near_t,
+          z_pos_far  = oz + dz * far_t;
+
+    // Cylinder fully contains the segment of the ray
+    bool in_bounds = near_t < ray.mint && far_t > ray.maxt;
+
+    bool valid_intersection =
+        solution_found && !out_bounds && !in_bounds &&
+        ((z_pos_near >= 0.f && z_pos_near <= length && near_t > ray.mint) ||
+         (z_pos_far  >= 0.f && z_pos_far  <= length && far_t < ray.maxt));
+
+    float t = (z_pos_near >= 0 && z_pos_near <= length && near_t >= 0.f ? near_t : far_t);
+
+    if (valid_intersection)
+        optixReportIntersection(t, OPTIX_HIT_KIND_TRIANGLE_FRONT_FACE);
+}
+#endif

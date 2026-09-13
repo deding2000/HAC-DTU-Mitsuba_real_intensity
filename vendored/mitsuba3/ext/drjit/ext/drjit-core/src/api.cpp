@@ -1,0 +1,2441 @@
+/*
+    src/api.cpp -- C -> C++ API locking wrappers
+
+    Copyright (c) 2021 Wenzel Jakob <wenzel.jakob@epfl.ch>
+
+    All rights reserved. Use of this source code is governed by a BSD-style
+    license that can be found in the LICENSE file.
+*/
+
+#include "internal.h"
+#include "var.h"
+#include "eval.h"
+#include "log.h"
+#include "util.h"
+#include "registry.h"
+#include "llvm.h"
+#include "tex.h"
+#if defined(DRJIT_ENABLE_CUDA)
+#  include "cuda_tex.h"
+#  include "cuda_green.h"
+#endif
+#include "op.h"
+#include "call.h"
+#include "loop.h"
+#include "cond.h"
+#include "profile.h"
+#include "array.h"
+#include "record_ts.h"
+#include "coop_vec.h"
+#include "reorder.h"
+#include <thread>
+#include <condition_variable>
+#include <drjit-core/half.h>
+#include <drjit-core/texture.h>
+
+#if defined(DRJIT_ENABLE_OPTIX)
+#  include <drjit-core/optix.h>
+#  include "optix.h"
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+#  include <drjit-core/metal.h>
+#  include "metal.h"
+#  include "metal_tex.h"
+#endif
+
+#include <nanothread/nanothread.h>
+
+void jit_init(uint32_t backends) {
+    lock_guard guard(state.lock);
+    jitc_init(backends);
+}
+
+void jit_init_async(uint32_t backends) {
+    /// Probably overkill for a simple wait flag..
+    struct Sync {
+        bool flag = false;
+        std::mutex lock;
+        std::condition_variable cv;
+    };
+
+    std::shared_ptr<Sync> sync = std::make_shared<Sync>();
+    std::unique_lock<std::mutex> guard(sync->lock);
+
+    std::thread([backends, sync]() {
+        lock_guard guard2(state.lock);
+        {
+            std::unique_lock<std::mutex> guard3(sync->lock);
+            sync->flag = true;
+            sync->cv.notify_one();
+        }
+        jitc_init(backends);
+    }).detach();
+
+    while (!sync->flag)
+        sync->cv.wait(guard);
+}
+
+int jit_has_backend(JitBackend backend) {
+    lock_guard guard(state.lock);
+
+    bool result;
+    switch (backend) {
+        case JitBackend::LLVM:
+            result = state.backends & (1u << (uint32_t) JitBackend::LLVM);
+            break;
+
+        case JitBackend::CUDA:
+#if defined(DRJIT_ENABLE_CUDA)
+            result = (state.backends & (1u << (uint32_t) JitBackend::CUDA))
+                && !state.devices.empty();
+#else
+            result = false;
+#endif
+            break;
+
+        case JitBackend::Metal:
+#if defined(DRJIT_ENABLE_METAL)
+            result = (state.backends & (1u << (uint32_t) JitBackend::Metal))
+                && !state.metal_devices.empty();
+#else
+            result = false;
+#endif
+            break;
+
+        default:
+            jitc_raise("jit_has_backend(): invalid input!");
+    }
+
+    return (int) result;
+}
+
+void jit_shutdown(int light) {
+    lock_guard guard(state.lock);
+    jitc_shutdown(light);
+}
+
+uint32_t jit_scope(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return thread_state(backend)->scope;
+}
+
+void jit_set_scope(JitBackend backend, uint32_t scope) {
+    lock_guard guard(state.lock);
+    jitc_trace("jit_set_scope(%u)", scope);
+    thread_state(backend)->scope = scope;
+}
+
+uint32_t jit_new_scope(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_new_scope(backend);
+}
+
+uint32_t jit_advance_scope(JitBackend backend, uint32_t n) {
+    lock_guard guard(state.lock);
+    return jitc_advance_scope(backend, n);
+}
+
+void jit_set_log_level_stderr(LogLevel level) {
+    /// Allow changing this variable without acquiring a lock
+    state.log_level_stderr = level;
+    state.log_level_combined = std::max(level, state.log_level_callback);
+}
+
+LogLevel jit_log_level_stderr() {
+    /// Allow reading this variable without acquiring a lock
+    return state.log_level_stderr;
+}
+
+void jit_set_log_level_callback(LogLevel level, LogCallback callback) {
+    lock_guard guard(state.lock);
+    state.log_level_callback = callback ? level : Disable;
+    state.log_callback = callback;
+    state.log_level_combined =
+        std::max(state.log_level_stderr, state.log_level_callback);
+}
+
+LogLevel jit_log_level_callback() {
+    lock_guard guard(state.lock);
+    return state.log_level_callback;
+}
+
+void jit_log(LogLevel level, const char* fmt, ...) {
+    lock_guard guard(state.lock);
+    va_list args;
+    va_start(args, fmt);
+    jitc_vlog(level, fmt, args);
+    va_end(args);
+}
+
+void jit_raise(const char* fmt, ...) {
+    lock_guard guard(state.lock);
+    va_list args;
+    va_start(args, fmt);
+    jitc_vraise(fmt, args);
+    // va_end(args); (dead code)
+}
+
+void jit_fail(const char* fmt, ...) noexcept {
+    lock_guard guard(state.lock);
+    va_list args;
+    va_start(args, fmt);
+    jitc_vfail(fmt, args);
+    // va_end(args); (dead code)
+}
+
+void jit_set_flags(uint32_t flags) {
+    jitc_set_flags(flags);
+}
+
+uint32_t jit_flags() {
+    return jitc_flags();
+}
+
+void jit_set_flag(JitFlag flag, int enable) {
+    jitc_set_flag(flag, enable);
+}
+
+int jit_flag(JitFlag flag) {
+    return jitc_flag(flag);
+}
+
+void jit_state_lock() { lock_acquire(state.lock); }
+
+void jit_state_unlock() { lock_release(state.lock); }
+
+uint32_t jit_record_checkpoint(JitBackend backend) {
+    uint32_t result = (uint32_t) thread_state(backend)->side_effects_symbolic.size();
+    if (jit_flag(JitFlag::SymbolicScope))
+        result |= 0x80000000u;
+    return result;
+}
+
+uint32_t jit_record_begin(JitBackend backend, const char *name) {
+    ThreadState *ts = thread_state(backend);
+    std::vector<std::string> &stack = ts->record_stack;
+
+    // Potentially signal failure to limit recursion depth
+    if (name && std::count(stack.begin(), stack.end(), name) > 1)
+        return uint32_t(-1);
+    stack.push_back(name ? name : std::string());
+
+    if (name)
+        jitc_log(Debug, "jit_record_begin(\"%s\")", name);
+    else
+        jitc_log(Debug, "jit_record_begin()");
+
+    uint32_t result = (uint32_t) ts->side_effects_symbolic.size();
+    if (jit_flag(JitFlag::SymbolicScope))
+        result |= 0x80000000u;
+    jit_set_flag(JitFlag::SymbolicScope, true);
+
+    return result;
+}
+
+void jit_record_end(JitBackend backend, uint32_t value, int cleanup) {
+    jitc_log(Debug, "jit_record_end()");
+
+    ThreadState *ts = thread_state(backend);
+    std::vector<std::string> &stack = ts->record_stack;
+
+    if (unlikely(stack.empty()))
+        jitc_fail("jit_record_end(): stack underflow!");
+
+    stack.pop_back();
+
+    // Set recording flag to previous value
+    jit_set_flag(JitFlag::SymbolicScope, (value & 0x80000000u) != 0);
+    value &= 0x7fffffff;
+
+    if (cleanup) {
+        lock_guard guard(state.lock);
+        std::vector<uint32_t> &se = ts->side_effects_symbolic;
+        if (value > se.size())
+            jitc_raise("jit_record_end(): position lies beyond the end of the queue!");
+
+        while (value < se.size()) {
+            uint32_t index = se.back();
+            se.pop_back();
+            jitc_log(Debug, "jit_record_end(): deleting side effect r%u", index);
+            jitc_var_dec_ref(index);
+        }
+    }
+}
+
+#if defined(DRJIT_ENABLE_CUDA)
+void* jit_cuda_stream() {
+    lock_guard guard(state.lock);
+    return jitc_cuda_stream();
+}
+
+void* jit_cuda_context() {
+    lock_guard guard(state.lock);
+    return jitc_cuda_context();
+}
+
+void jit_cuda_push_context(void* ctx) {
+    lock_guard guard(state.lock);
+    jitc_cuda_push_context(ctx);
+}
+
+void* jit_cuda_pop_context() {
+    lock_guard guard(state.lock);
+    return jitc_cuda_pop_context();
+}
+
+CUDAGreenContext *jit_cuda_green_context_make(uint32_t sm_count,
+                                              uint32_t *sm_count_actual,
+                                              void **other_context) {
+    lock_guard guard(state.lock);
+    return (CUDAGreenContext *) jitc_cuda_green_context_make(sm_count,
+                                                             sm_count_actual,
+                                                             other_context);
+}
+
+void jit_cuda_green_context_release(CUDAGreenContext *ctx) {
+    lock_guard guard(state.lock);
+    jitc_cuda_green_context_release(ctx);
+}
+
+void *jit_cuda_green_context_enter(CUDAGreenContext *ctx) {
+    return jitc_cuda_green_context_enter(ctx);
+}
+
+void jit_cuda_green_context_leave(void *token) {
+    jitc_cuda_green_context_leave(token);
+}
+
+int jit_cuda_device_count() {
+    lock_guard guard(state.lock);
+    return (int) state.devices.size();
+}
+
+void jit_cuda_set_device(int device) {
+    lock_guard guard(state.lock);
+    jitc_cuda_set_device(device);
+}
+
+int jit_cuda_device() {
+    lock_guard guard(state.lock);
+    return thread_state(JitBackend::CUDA)->device;
+}
+
+int jit_cuda_device_raw() {
+    lock_guard guard(state.lock);
+    return state.devices[thread_state(JitBackend::CUDA)->device].id;
+}
+
+int jit_cuda_compute_capability() {
+    lock_guard guard(state.lock);
+    return state.devices[thread_state(JitBackend::CUDA)->device].compute_capability;
+}
+
+void jit_cuda_set_target(uint32_t ptx_version, uint32_t compute_capability) {
+    lock_guard guard(state.lock);
+    ThreadState *ts = thread_state(JitBackend::CUDA);
+    ts->ptx_version = ptx_version;
+    ts->compute_capability = compute_capability;
+}
+
+void *jit_cuda_lookup(const char *name) {
+    lock_guard guard(state.lock);
+    return jitc_cuda_lookup(name);
+}
+
+void jit_cuda_sync_stream(uintptr_t stream) {
+    // Only using thread-local state so no shared JIT state synchronization needed
+    return jitc_cuda_sync_stream(stream);
+}
+#else
+static void jit_cuda_unavailable() {
+    jitc_raise("The Dr.Jit CUDA backend is unavailable: Dr.Jit was compiled "
+               "without CUDA support.");
+}
+void* jit_cuda_stream() { jit_cuda_unavailable(); return nullptr; }
+void* jit_cuda_context() { jit_cuda_unavailable(); return nullptr; }
+void jit_cuda_push_context(void*) { jit_cuda_unavailable(); }
+void* jit_cuda_pop_context() { jit_cuda_unavailable(); return nullptr; }
+CUDAGreenContext *jit_cuda_green_context_make(uint32_t, uint32_t *, void **) {
+    jit_cuda_unavailable(); return nullptr;
+}
+void jit_cuda_green_context_release(CUDAGreenContext *) { jit_cuda_unavailable(); }
+void *jit_cuda_green_context_enter(CUDAGreenContext *) { jit_cuda_unavailable(); return nullptr; }
+void jit_cuda_green_context_leave(void *) { jit_cuda_unavailable(); }
+int jit_cuda_device_count() { return 0; }
+void jit_cuda_set_device(int) { jit_cuda_unavailable(); }
+int jit_cuda_device() { jit_cuda_unavailable(); return -1; }
+int jit_cuda_device_raw() { jit_cuda_unavailable(); return -1; }
+int jit_cuda_compute_capability() { jit_cuda_unavailable(); return 0; }
+void jit_cuda_set_target(uint32_t, uint32_t) { jit_cuda_unavailable(); }
+void *jit_cuda_lookup(const char *) { jit_cuda_unavailable(); return nullptr; }
+void jit_cuda_sync_stream(uintptr_t) { jit_cuda_unavailable(); }
+#endif
+
+void jit_llvm_set_thread_count(uint32_t size) {
+    pool_set_size(nullptr, size);
+}
+
+void jit_llvm_set_block_size(uint32_t size) {
+    if ((size & (size - 1)) != 0 || size < jitc_llvm_vector_width)
+        jit_raise("jit_llvm_set_block_size(): value must be a power of two and "
+                  "bigger than the packet size (%u)!", jitc_llvm_vector_width);
+    jitc_llvm_block_size = size;
+}
+
+uint32_t jit_llvm_block_size() {
+    return jitc_llvm_block_size;
+}
+
+uint32_t jit_llvm_thread_count() {
+    return pool_size(nullptr);
+}
+
+// ==========================================================================
+//                          Metal-specific API
+// ==========================================================================
+
+int jit_metal_device_count() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return (int) state.metal_devices.size();
+#else
+    return 0;
+#endif
+}
+
+void jit_metal_set_device(int device) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    if (device < 0 || (size_t) device >= state.metal_devices.size())
+        jit_raise("jit_metal_set_device(%i): out of range (have %i devices).",
+                  device, (int) state.metal_devices.size());
+
+    ThreadState *ts = thread_state(JitBackend::Metal);
+    if (ts->device == device)
+        return;
+
+    MetalDevice &md = state.metal_devices[device];
+    ts->device = device;
+    ts->metal_device = md.device;
+    ts->metal_queue  = md.queue;
+    ts->metal_simd_width  = md.simd_width;
+    ts->metal_max_threads = md.max_threads_per_threadgroup;
+#else
+    (void) device;
+    jit_raise("jit_metal_set_device(): the Metal backend is not enabled in "
+              "this build of Dr.Jit.");
+#endif
+}
+
+int jit_metal_device() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return thread_state(JitBackend::Metal)->device;
+#else
+    return -1;
+#endif
+}
+
+void *jit_metal_device_handle() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return thread_state(JitBackend::Metal)->metal_device;
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_metal_queue() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return thread_state(JitBackend::Metal)->metal_queue;
+#else
+    return nullptr;
+#endif
+}
+
+int jit_metal_supports_ray_tracing() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    int dev = thread_state(JitBackend::Metal)->device;
+    if (dev < 0 || (size_t) dev >= state.metal_devices.size())
+        return 0;
+    return state.metal_devices[dev].supports_ray_tracing ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+void *jit_metal_context() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return jitc_metal_context_impl();
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_metal_command_queue() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return jitc_metal_command_queue_impl();
+#else
+    return nullptr;
+#endif
+}
+
+uint32_t jit_metal_configure_scene(void *accel, void **resources,
+                                   uint32_t n_resources,
+                                   void *intersection_fn_library,
+                                   uint32_t n_ift_entries,
+                                   const char **ift_function_names,
+                                   uint32_t n_ift_buffers,
+                                   void **ift_buffers,
+                                   const uint32_t *ift_buffer_slots,
+                                   uint32_t geometry_types_mask) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    return jitc_metal_configure_scene(accel, resources,
+                                      n_resources,
+                                      intersection_fn_library,
+                                      n_ift_entries,
+                                      ift_function_names,
+                                      n_ift_buffers,
+                                      ift_buffers,
+                                      ift_buffer_slots,
+                                      geometry_types_mask);
+#else
+    (void) accel; (void) resources; (void) n_resources;
+    (void) intersection_fn_library; (void) n_ift_entries;
+    (void) ift_function_names; (void) n_ift_buffers; (void) ift_buffers;
+    (void) ift_buffer_slots; (void) geometry_types_mask;
+    jit_raise("jit_metal_configure_scene(): Metal backend not enabled.");
+    return 0;
+#endif
+}
+
+void jit_metal_ray_trace(uint32_t n_args, uint32_t *args,
+                         uint32_t mask, uint32_t *out, uint32_t n_out,
+                         uint32_t scene, int shadow) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_METAL)
+    jitc_metal_ray_trace(n_args, args, mask, out, n_out, scene, shadow);
+#else
+    (void) n_args; (void) args; (void) mask; (void) out; (void) n_out;
+    (void) scene; (void) shadow;
+    jit_raise("jit_metal_ray_trace(): Metal backend not enabled.");
+#endif
+}
+
+void *jit_metal_lookup_buffer(void *ptr, size_t *offset) {
+#if defined(DRJIT_ENABLE_METAL)
+    lock_guard guard(state.lock);
+    return jitc_metal_find_buffer(ptr, offset);
+#else
+    (void) ptr; (void) offset;
+    return nullptr;
+#endif
+}
+
+uint32_t jit_metal_scene_owner_handle(uint32_t scene_index) {
+#if defined(DRJIT_ENABLE_METAL)
+    lock_guard guard(state.lock);
+    return jitc_metal_scene_owner_handle(scene_index);
+#else
+    (void) scene_index;
+    jit_raise("jit_metal_scene_owner_handle(): Metal backend not enabled.");
+    return 0;
+#endif
+}
+
+void jit_metal_scene_set_cleanup(uint32_t scene_index,
+                                 void (*callback)(void *), void *payload) {
+#if defined(DRJIT_ENABLE_METAL)
+    lock_guard guard(state.lock);
+    MetalScene *scene = jitc_metal_get_scene(scene_index);
+    scene->cleanup = callback;
+    scene->cleanup_payload = payload;
+#else
+    (void) scene_index; (void) callback; (void) payload;
+#endif
+}
+
+void jit_llvm_set_target(const char *target_cpu,
+                         const char *target_features,
+                         uint32_t vector_width) {
+    lock_guard guard(state.lock);
+    jitc_llvm_set_target(target_cpu, target_features, vector_width);
+}
+
+const char *jit_llvm_target_cpu() {
+    lock_guard guard(state.lock);
+    return jitc_llvm_target_cpu;
+}
+
+const char *jit_llvm_target_features() {
+    lock_guard guard(state.lock);
+    return jitc_llvm_target_features;
+}
+
+void jit_llvm_version(int *major, int *minor, int *patch) {
+    lock_guard guard(state.lock);
+    if (major)
+        *major = jitc_llvm_version_major;
+    if (minor)
+        *minor = jitc_llvm_version_minor;
+    if (patch)
+        *patch = jitc_llvm_version_patch;
+}
+
+void jit_cuda_version(int *major, int *minor) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+    if (major)
+        *major = jitc_cuda_version_major;
+    if (minor)
+        *minor = jitc_cuda_version_minor;
+#else
+    if (major)
+        *major = 0;
+    if (minor)
+        *minor = 0;
+#endif
+}
+
+uint32_t jit_llvm_vector_width() {
+    return jitc_llvm_vector_width;
+}
+
+void jit_sync_thread() {
+    lock_guard guard(state.lock);
+    jitc_sync_thread();
+}
+
+void jit_flush_thread() {
+    lock_guard guard(state.lock);
+    jitc_flush_thread();
+}
+
+void jit_sync_device() {
+    lock_guard guard(state.lock);
+    jitc_sync_device();
+}
+
+void jit_sync_all_devices() {
+    lock_guard guard(state.lock);
+    jitc_sync_all_devices();
+}
+
+void jit_flush_kernel_cache() {
+    lock_guard guard(state.lock);
+    jitc_flush_kernel_cache();
+}
+
+void *jit_malloc(JitBackend backend, size_t size, int shared) {
+    lock_guard guard(state.lock);
+    return jitc_malloc(backend, size, shared != 0);
+}
+
+void jit_free(void *ptr) {
+    lock_guard guard(state.lock);
+    jitc_free(ptr);
+}
+
+void jit_flush_malloc_cache() {
+    lock_guard guard(state.lock);
+    jitc_flush_malloc_cache(false);
+}
+
+void jit_malloc_clear_statistics() {
+    lock_guard guard(state.lock);
+    jitc_malloc_clear_statistics();
+}
+
+int jit_malloc_device(void *ptr) {
+    lock_guard guard(state.lock);
+    return jitc_malloc_device(ptr);
+}
+
+void *jit_malloc_migrate(void *ptr, JitBackend backend, int move) {
+    lock_guard guard(state.lock);
+    return jitc_malloc_migrate(ptr, backend, move);
+}
+
+size_t jit_malloc_watermark(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_malloc_watermark(backend);
+}
+
+int jit_var_device(uint32_t index) {
+    if (index == 0)
+        return -1;
+    lock_guard guard(state.lock);
+    return jitc_var_device(index);
+}
+
+uint32_t jit_var_literal(JitBackend backend, VarType type, const void *value,
+                             size_t size, int eval) {
+    lock_guard guard(state.lock);
+    return jitc_var_literal(backend, type, value, size, eval);
+}
+
+uint32_t jit_var_bool(JitBackend backend, bool value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(bool));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Bool;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_u8(JitBackend backend, uint8_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(uint8_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::UInt8;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_i8(JitBackend backend, int8_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(int8_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Int8;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_u32(JitBackend backend, uint32_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(uint32_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::UInt32;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_i32(JitBackend backend, int32_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(int32_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Int32;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_u64(JitBackend backend, uint64_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(uint64_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::UInt64;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_i64(JitBackend backend, int64_t value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(int64_t));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Int64;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_f16(JitBackend backend, drjit::half value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(drjit::half));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Float16;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_f32(JitBackend backend, float value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(float));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Float32;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_f64(JitBackend backend, double value) {
+    Variable v;
+    memcpy(&v.literal, &value, sizeof(double));
+    v.kind = (uint32_t) VarKind::Literal;
+    v.type = (uint32_t) VarType::Float64;
+    v.size = 1;
+    v.backend = (uint32_t) backend;
+    lock_guard guard(state.lock);
+    return jitc_var_new(v);
+}
+
+uint32_t jit_var_class(JitBackend backend, void *ptr) {
+    uint32_t value = jit_registry_id(ptr);
+
+    ThreadState *ts = thread_state(backend);
+    if (value && ts->call_self_value == value) {
+        jit_var_inc_ref(ts->call_self_index);
+        return ts->call_self_index;
+    }
+
+    return jit_var_u32(backend, value);
+}
+
+uint32_t jit_var_undefined(JitBackend backend, VarType type, size_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_undefined(backend, type, size);
+}
+
+uint32_t jit_var_counter(JitBackend backend, size_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_counter(backend, size, true);
+}
+
+uint32_t jit_var_op(JitOp op, const uint32_t *dep) {
+    lock_guard guard(state.lock);
+    return jitc_var_op(op, dep);
+}
+
+uint32_t jit_var_gather(uint32_t source, uint32_t index, uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_var_gather(source, index, mask);
+}
+
+uint32_t jit_var_call_getter(VarType type, uint32_t count,
+                             const uint32_t *values, uint32_t index,
+                             uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_var_call_getter(type, count, values, index, mask);
+}
+
+void jit_var_gather_packet(size_t n, uint32_t source, uint32_t index, uint32_t mask, uint32_t *out) {
+    lock_guard guard(state.lock);
+    jitc_var_gather_packet(n, source, index, mask, out);
+}
+
+uint32_t jit_var_scatter(uint32_t target, uint32_t value,
+                         uint32_t index, uint32_t mask,
+                         ReduceOp op, ReduceMode mode) {
+    lock_guard guard(state.lock);
+    return jitc_var_scatter(target, value, index, mask, op, mode);
+}
+
+uint32_t jit_var_scatter_packet(size_t n, uint32_t target,
+                                const uint32_t *values, uint32_t index,
+                                uint32_t mask, ReduceOp op, ReduceMode mode) {
+    lock_guard guard(state.lock);
+    return jitc_var_scatter_packet(n, target, values, index, mask, op, mode);
+}
+
+uint32_t jit_var_scatter_inc(uint32_t *target, uint32_t index, uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_var_scatter_inc(target, index, mask);
+}
+
+uint32_t jit_var_scatter_exch(uint32_t *target, uint32_t value, uint32_t index,
+                              uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_var_scatter_exch(target, value, index, mask);
+}
+
+void jit_var_scatter_cas(uint32_t *target, uint32_t compare, uint32_t value,
+                         uint32_t index, uint32_t mask, uint32_t *old,
+                         uint32_t *success) {
+    lock_guard guard(state.lock);
+    jitc_var_scatter_cas(target, compare, value, index, mask, old, success);
+}
+
+uint32_t jit_var_pointer(JitBackend backend, const void *value,
+                         uint32_t dep, int write) {
+    lock_guard guard(state.lock);
+    return jitc_var_pointer(backend, value, dep, write);
+}
+
+uint32_t jit_var_call_input(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_call_input(index);
+}
+
+uint32_t jit_var_inc_ref_impl(uint32_t index) noexcept {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    jitc_var_inc_ref(index);
+    return index;
+}
+
+void jit_var_dec_ref_impl(uint32_t index) noexcept {
+    if (index == 0)
+        return;
+
+    lock_guard guard(state.lock);
+    jitc_var_dec_ref(index);
+}
+
+uint32_t jit_var_ref(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    return jitc_var(index)->ref_count;
+}
+
+uint32_t jit_var_data(uint32_t index, void **ptr_out) {
+    lock_guard guard(state.lock);
+    return jitc_var_data(index, true, ptr_out);
+}
+
+size_t jit_var_size(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    return (size_t) jitc_var(index)->size;
+}
+
+uint32_t jit_var_opaque_width(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+
+    Variable *var      = jitc_var(index);
+    JitBackend backend = (JitBackend) var->backend;
+    uint32_t var_size  = var->size;
+
+    // The variable has to be evaluated, to notify the ThreadState
+    jitc_var_eval(index);
+
+    uint32_t width_index =
+        jitc_var_literal(backend, VarType::UInt32, &var_size, 1, true);
+
+    ThreadState *ts = thread_state(backend);
+    ts->notify_opaque_width(index, width_index);
+
+    return width_index;
+}
+
+VarState jit_var_state(uint32_t index) {
+    if (index == 0)
+        return VarState::Invalid;
+
+    lock_guard guard(state.lock);
+    return jitc_var_state(index);
+}
+
+int jit_var_is_zero_literal(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    const Variable *v = jitc_var(index);
+    return v->is_literal() && v->literal == 0;
+}
+
+int jit_var_is_finite_literal(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    const Variable *v = jitc_var(index);
+    if (!v->is_literal())
+        return 0;
+
+    switch ((VarType) v->type) {
+        case VarType::Float16: {
+                drjit::half h;
+                memcpy((void*)&h, &v->literal, sizeof(drjit::half));
+                return (int) std::isnormal((float)h);
+        }
+
+        case VarType::Float32: {
+                float f;
+                memcpy(&f, &v->literal, sizeof(float));
+                return (int) std::isnormal(f);
+            }
+
+        case VarType::Float64: {
+                double d;
+                memcpy(&d, &v->literal, sizeof(double));
+                return (int) std::isnormal(d);
+            }
+
+        default:
+            return 1;
+    }
+}
+
+int jit_var_is_unaligned(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    Variable *var = jitc_var(index);
+
+    return (VarKind) var->kind == VarKind::Evaluated && var->unaligned;
+}
+
+uint32_t jit_var_resize(uint32_t index, size_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_resize(index, size);
+}
+
+VarType jit_var_type(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_type(index);
+}
+
+const char *jit_var_kind_name(uint32_t index) {
+    lock_guard guard(state.lock);
+    return var_kind_name[jitc_var(index)->kind];
+}
+
+int jit_var_is_dirty(uint32_t index) {
+    if (index == 0)
+        return 0;
+
+    lock_guard guard(state.lock);
+    return jitc_var(index)->is_dirty();
+}
+
+const char *jit_var_label(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_label(index);
+}
+
+uint32_t jit_var_set_label(uint32_t index, size_t argc, ...) {
+    if (unlikely(index == 0))
+        return 0;
+
+    const char *label = nullptr;
+
+    // First, turn the variable-length argument list into a usable label
+    va_list ap;
+    va_start(ap, argc);
+
+    StringBuffer buf;
+    if (argc == 1) {
+        label = va_arg(ap, const char *);
+    } else if (argc > 1) {
+        for (size_t i = 0; i < argc; ++i) {
+            const char *s = va_arg(ap, const char *);
+            bool isnum = s[0] >= '0' || s[1] <= '9';
+
+            if (isnum) {
+                buf.put('[');
+                buf.put(s, strlen(s));
+                buf.put(']');
+            } else {
+                if (i > 0)
+                    buf.put('.');
+                buf.put(s, strlen(s));
+            }
+        }
+        label = buf.get();
+    }
+    va_end(ap);
+
+    lock_guard guard(state.lock);
+
+    Variable *v = jitc_var(index);
+
+    if (v->ref_count == 1) {
+        jitc_var_set_label(index, label);
+        jitc_var_inc_ref(index, v);
+        return index;
+    } else {
+        uint32_t result = jitc_var_copy(index);
+        jitc_var_set_label(result, label);
+        return result;
+    }
+}
+
+void jit_var_set_callback(uint32_t index,
+                          void (*callback)(uint32_t, int, void *),
+                          void *data) {
+    lock_guard guard(state.lock);
+    jitc_var_set_callback(index, callback, data, false);
+}
+
+uint32_t jit_var_mem_map(JitBackend backend, VarType type, void *ptr, size_t size, int free) {
+    lock_guard guard(state.lock);
+    return jitc_var_mem_map(backend, type, ptr, size, free);
+}
+
+uint32_t jit_var_mem_copy(JitBackend backend, VarType vtype, const void *value,
+                          size_t size, int from_host) {
+    lock_guard guard(state.lock);
+    return jitc_var_mem_copy(backend, vtype, value, size, from_host != 0);
+}
+
+uint32_t jit_var_copy(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_copy(index);
+}
+
+uint32_t jit_var_migrate(uint32_t index, JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_var_migrate(index, backend);
+}
+
+void jit_var_mark_side_effect(uint32_t index) {
+    lock_guard guard(state.lock);
+    jitc_var_mark_side_effect(index);
+}
+
+uint32_t jit_var_mask_peek(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_var_mask_peek(backend);
+}
+
+uint32_t jit_var_mask_apply(uint32_t index, uint32_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_mask_apply(index, size);
+}
+
+void jit_var_mask_push(JitBackend backend, uint32_t index) {
+    lock_guard guard(state.lock);
+    jitc_var_mask_push(backend, index);
+}
+
+void jit_var_mask_pop(JitBackend backend) {
+    lock_guard guard(state.lock);
+    jitc_var_mask_pop(backend);
+}
+
+uint32_t jit_var_mask_default(JitBackend backend, size_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_mask_default(backend, size);
+}
+
+int jit_var_any(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_any(index);
+}
+
+int jit_var_all(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_all(index);
+}
+
+uint32_t jit_var_any_async(JitBackend backend, uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_any_async(backend, index);
+}
+
+uint32_t jit_var_all_async(JitBackend backend, uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_all_async(backend, index);
+}
+
+uint32_t jit_var_reduce(JitBackend backend, VarType vt, ReduceOp op,
+                        uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_reduce(backend, vt, op, index);
+}
+
+uint32_t jit_var_reduce_dot(uint32_t index_1,
+                            uint32_t index_2) {
+    lock_guard guard(state.lock);
+    return jitc_var_reduce_dot(index_1, index_2);
+}
+
+uint32_t jit_var_block_prefix_reduce(ReduceOp op, uint32_t index,
+                                     uint32_t block_size, int exclusive,
+                                     int reverse) {
+    lock_guard guard(state.lock);
+    return jitc_var_block_prefix_reduce(op, index, block_size, exclusive != 0,
+                                        reverse != 0);
+}
+
+const char *jit_var_whos() {
+    lock_guard guard(state.lock);
+    return jitc_var_whos();
+}
+
+const char *jit_var_graphviz() {
+    lock_guard guard(state.lock);
+    return jitc_var_graphviz();
+}
+
+const char *jit_var_str(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_str(index);
+}
+
+void jit_var_read(uint32_t index, size_t offset, void *dst) {
+    lock_guard guard(state.lock);
+    jitc_var_read(index, offset, dst);
+}
+
+uint32_t jit_var_write(uint32_t index, size_t offset, const void *src) {
+    lock_guard guard(state.lock);
+    return jitc_var_write(index, offset, src);
+}
+
+void jit_eval() {
+    lock_guard guard(state.lock);
+    ThreadLocal &tl = jitc_thread_local();
+#if defined(DRJIT_ENABLE_CUDA)
+    if (tl.ts_cuda)
+        jitc_eval(tl.ts_cuda);
+#endif
+    if (tl.ts_llvm)
+        jitc_eval(tl.ts_llvm);
+#if defined(DRJIT_ENABLE_METAL)
+    if (tl.ts_metal)
+        jitc_eval(tl.ts_metal);
+#endif
+}
+
+int jit_var_eval(uint32_t index) {
+    if (index == 0)
+        return 0;
+    lock_guard guard(state.lock);
+    return jitc_var_eval(index);
+}
+
+int jit_var_schedule(uint32_t index) {
+    if (index == 0)
+        return 0;
+    lock_guard guard(state.lock);
+    return jitc_var_schedule(index);
+}
+
+uint32_t jit_var_schedule_force(uint32_t index, int *rv) {
+    lock_guard guard(state.lock);
+    return jitc_var_schedule_force(index, rv);
+}
+
+void jit_prefix_push(JitBackend backend, const char *value) {
+    lock_guard guard(state.lock);
+    jitc_prefix_push(backend, value);
+}
+
+void jit_prefix_pop(JitBackend backend) {
+    lock_guard guard(state.lock);
+    jitc_prefix_pop(backend);
+}
+
+const char *jit_prefix(JitBackend backend) {
+    return thread_state(backend)->prefix;
+}
+
+void jit_memset_async(JitBackend backend, void *ptr, uint32_t size, uint32_t isize,
+                      const void *src) {
+    lock_guard guard(state.lock);
+    jitc_memset_async(backend, ptr, size, isize, src);
+}
+
+void jit_memcpy(JitBackend backend, void *dst, const void *src, size_t size) {
+    lock_guard guard(state.lock);
+    jitc_memcpy(backend, dst, src, size);
+}
+
+void jit_memcpy_async(JitBackend backend, void *dst, const void *src, size_t size) {
+    lock_guard guard(state.lock);
+    jitc_memcpy_async(backend, dst, src, size);
+}
+
+void jit_reduce(JitBackend backend, VarType type, ReduceOp op,
+                uint32_t size, const void *in, void *out) {
+    lock_guard guard(state.lock);
+    jitc_reduce(backend, type, op, size, in, out);
+}
+
+void jit_block_reduce(JitBackend backend, VarType type, ReduceOp op,
+                      uint32_t size, uint32_t block_size, const void *in,
+                      void *out) {
+    lock_guard guard(state.lock);
+    jitc_block_reduce(backend, type, op, size, block_size, in, out);
+}
+
+void jit_batched_gemm(JitBackend backend, VarType type, int At, int Bt,
+                uint32_t M, uint32_t N, uint32_t K,
+                const GemmBatch *batch,
+                const void *A, const void *B, void *C) {
+    lock_guard guard(state.lock);
+    jitc_batched_gemm(backend, type, At != 0, Bt != 0, M, N, K, batch, A, B, C);
+}
+
+uint32_t jit_var_batched_gemm(uint32_t A, uint32_t B, int At, int Bt,
+                        uint32_t M, uint32_t N, uint32_t K,
+                        const GemmBatch *batch) {
+    lock_guard guard(state.lock);
+    return jitc_var_batched_gemm(A, B, At != 0, Bt != 0, M, N, K, batch);
+}
+
+void jit_block_prefix_reduce(JitBackend backend, VarType type, ReduceOp op,
+                             uint32_t block_size, uint32_t size, int exclusive,
+                             int reverse, const void *in, void *out) {
+    lock_guard guard(state.lock);
+    jitc_block_prefix_reduce(backend, type, op, block_size, size,
+                             exclusive != 0, reverse != 0, in, out);
+}
+
+uint32_t jit_compress(JitBackend backend, const uint8_t *in, uint32_t size, uint32_t *out) {
+    lock_guard guard(state.lock);
+    return jitc_compress(backend, in, size, out);
+}
+
+uint32_t jit_block_mkperm(JitBackend backend, const uint32_t *values,
+                           uint32_t size, uint32_t block_size,
+                           uint32_t bucket_count, uint32_t *perm,
+                           uint32_t *offsets) {
+    lock_guard guard(state.lock);
+    return jitc_block_mkperm(backend, values, size, block_size, bucket_count,
+                               perm, offsets);
+}
+
+uint32_t jit_registry_put(const char *variant, const char *domain, void *ptr) {
+    lock_guard guard(state.lock);
+    return jitc_registry_put(variant, domain, ptr);
+}
+
+void jit_registry_remove(const void *ptr) {
+    lock_guard guard(state.lock);
+    jitc_registry_remove(ptr);
+}
+
+uint32_t jit_registry_id(const void *ptr) {
+    lock_guard guard(state.lock);
+    return jitc_registry_id(ptr);
+}
+
+uint32_t jit_registry_id_bound(const char *variant, const char *domain) {
+    lock_guard guard(state.lock);
+    return jitc_registry_id_bound(variant, domain);
+}
+
+void jit_registry_get_pointers(const char *variant, const char *domain_name,
+                               void **dest) {
+    lock_guard guard(state.lock);
+    return jitc_registry_get_pointers(variant, domain_name, dest);
+}
+
+void *jit_registry_ptr(const char *variant, const char *domain, uint32_t id) {
+    lock_guard guard(state.lock);
+    return jitc_registry_ptr(variant, domain, id);
+}
+
+void *jit_registry_peek(const char *variant, const char *domain) {
+    lock_guard guard(state.lock);
+    return jitc_registry_peek(variant, domain);
+}
+
+void jit_registry_clear() {
+    lock_guard guard(state.lock);
+    jitc_registry_clear();
+}
+
+void jit_var_set_self(JitBackend backend, uint32_t value, uint32_t index) {
+    lock_guard guard(state.lock);
+    jitc_var_set_self(backend, value, index);
+}
+
+void jit_var_self(JitBackend backend, uint32_t *value, uint32_t *index) {
+    lock_guard guard(state.lock);
+    jitc_var_self(backend, value, index);
+}
+
+void jit_var_call(const char *name, int symbolic, uint32_t self, uint32_t mask,
+                  uint32_t n_inst, uint32_t max_inst_id,
+                  const uint32_t *inst_id, uint32_t n_in,
+                  const uint32_t *in, uint32_t n_out_nested,
+                  const uint32_t *out_nested, const uint32_t *se_offset,
+                  uint32_t *out) {
+    lock_guard guard(state.lock);
+    jitc_var_call(name, (bool) symbolic, self, mask, n_inst, max_inst_id,
+                  inst_id, n_in, in, n_out_nested, out_nested, se_offset, out);
+}
+
+void jit_aggregate(JitBackend backend, void *dst, AggregationEntry *agg,
+                   uint32_t size) {
+    lock_guard guard(state.lock);
+    return jitc_aggregate(backend, dst, agg, size);
+}
+
+struct CallBucket *jit_var_call_reduce(JitBackend backend, const char *variant,
+                                       const char *domain, uint32_t index,
+                                       uint32_t *bucket_count_inout) {
+    lock_guard guard(state.lock);
+    return jitc_var_call_reduce(backend, variant, domain, index,
+                                bucket_count_inout);
+}
+
+void jit_kernel_history_clear() {
+    lock_guard guard(state.lock);
+    state.kernel_history.clear();
+}
+
+struct KernelHistoryEntry *jit_kernel_history() {
+    lock_guard guard(state.lock);
+    jitc_sync_thread();
+    return state.kernel_history.get();
+}
+
+void jit_launch_stats(size_t *launches, size_t *soft_misses, size_t *hard_misses) {
+    lock_guard guard(state.lock);
+    if (launches)
+        *launches = state.kernel_launches;
+    if (soft_misses)
+        *soft_misses = state.kernel_soft_misses;
+    if (hard_misses)
+        *hard_misses = state.kernel_hard_misses;
+}
+
+#if defined(DRJIT_ENABLE_OPTIX)
+OptixDeviceContext jit_optix_context() {
+    lock_guard guard(state.lock);
+    return jitc_optix_context();
+}
+
+void *jit_optix_lookup(const char *name) {
+    lock_guard guard(state.lock);
+    return jitc_optix_lookup(name);
+}
+
+uint32_t jit_optix_configure_pipeline(const OptixPipelineCompileOptions *pco,
+                                      OptixModule module,
+                                      const OptixProgramGroup *pg,
+                                      uint32_t pg_count) {
+    lock_guard guard(state.lock);
+    return jitc_optix_configure_pipeline(pco, module, pg, pg_count);
+}
+
+uint32_t jit_optix_configure_sbt(const OptixShaderBindingTable *sbt, uint32_t pipeline) {
+    lock_guard guard(state.lock);
+    return jitc_optix_configure_sbt(sbt, pipeline);
+}
+
+void jit_optix_update_sbt(uint32_t index, const OptixShaderBindingTable *sbt) {
+    lock_guard guard(state.lock);
+    jitc_optix_update_sbt(index, sbt);
+}
+
+uint32_t jit_optix_sbt_owner_handle(uint32_t sbt_index) {
+    lock_guard guard(state.lock);
+    return jitc_optix_sbt_owner_handle(sbt_index);
+}
+
+void jit_optix_ray_trace(uint32_t n_args, uint32_t *args,
+                         uint32_t n_hit_object_field,
+                         OptixHitObjectField *hit_object_fields,
+                         uint32_t *hit_object_out,
+                         int reorder, uint32_t reorder_hint,
+                         uint32_t reorder_hint_num_bits, int invoke,
+                         uint32_t mask, uint32_t pipeline, uint32_t sbt) {
+    lock_guard guard(state.lock);
+    jitc_optix_ray_trace(n_args, args, n_hit_object_field, hit_object_fields,
+                         hit_object_out, reorder, reorder_hint,
+                         reorder_hint_num_bits, invoke, mask, pipeline, sbt);
+}
+
+uint32_t jit_optix_sbt_data_load(uint32_t sbt_data_ptr, VarType type,
+                                 uint32_t offset, uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_optix_sbt_data_load(sbt_data_ptr, type, offset, mask);
+}
+#endif
+
+void jit_llvm_ray_trace(uint32_t func, uint32_t scene, int shadow_ray,
+                        const uint32_t *in, uint32_t *out) {
+    lock_guard guard(state.lock);
+    jitc_llvm_ray_trace(func, scene, shadow_ray, in, out);
+}
+
+// Hardware textures dispatch to the CUDA or Metal implementation based on
+// ``backend``; any other backend (or one not compiled in) raises.
+static void jit_tex_unavailable(JitBackend backend) {
+    jitc_raise("jit_tex_*(): hardware textures are not available for the '%s' "
+               "backend (unsupported, or not compiled into this build).",
+               jitc_backend_name(backend));
+}
+
+void *jit_tex_create(JitBackend backend, size_t ndim, const size_t *shape,
+                     size_t n_channels, int format, int filter_mode,
+                     int wrap_mode, int writable, int srgb) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_create(ndim, shape, n_channels, format,
+                                    filter_mode, wrap_mode, writable, srgb);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_create(ndim, shape, n_channels, format,
+                                     filter_mode, wrap_mode, writable, srgb);
+#endif
+    jit_tex_unavailable(backend);
+    return nullptr;
+}
+
+void jit_tex_get_shape(const void *handle, size_t *shape) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_get_shape(handle, shape);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_get_shape(handle, shape);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_get_indices(const void *handle, uint32_t *indices) {
+    if (!handle)
+        return;
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_get_indices(handle, indices);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_get_indices(handle, indices);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_memcpy_d2t(const void *src_ptr, void *dst_handle) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) dst_handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_memcpy_d2t(src_ptr, dst_handle);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_memcpy_d2t(src_ptr, dst_handle);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_memcpy_t2d(const void *src_handle, void *dst_ptr) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) src_handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_memcpy_t2d(src_handle, dst_ptr);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_memcpy_t2d(src_handle, dst_ptr);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_lookup(const void *handle, const uint32_t *pos, uint32_t active,
+                    uint32_t *out) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_lookup(handle, pos, active, out);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_lookup(handle, pos, active, out);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_bilerp_fetch(const void *handle, const uint32_t *pos,
+                          uint32_t active, uint32_t *out) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_bilerp_fetch(handle, pos, active, out);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_bilerp_fetch(handle, pos, active, out);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void jit_tex_write(void *handle, const uint32_t *pos, const uint32_t *value,
+                   uint32_t active) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_write(handle, pos, value, active);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_write(handle, pos, value, active);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+void *jit_tex_wrap(JitBackend backend, uintptr_t handle, size_t ndim,
+                   int format, int writable, int filter_mode, int wrap_mode,
+                   int srgb) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_wrap(handle, ndim, format, writable, filter_mode,
+                                  wrap_mode, srgb);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_wrap(handle, ndim, format, writable, filter_mode,
+                                   wrap_mode, srgb);
+#endif
+    jit_tex_unavailable(backend);
+    return nullptr;
+}
+
+void jit_tex_map(void *handle) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(((const TextureBase *) handle)->backend))
+        return jitc_cuda_tex_map(handle);
+#endif
+    // The native MTLTexture / Dr.Jit-owned array is always usable -> no-op.
+    (void) handle;
+}
+
+void jit_tex_unmap(void *handle) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(((const TextureBase *) handle)->backend))
+        return jitc_cuda_tex_unmap(handle);
+#endif
+    (void) handle;
+}
+
+uintptr_t jit_tex_native_handle(const void *handle, size_t sub_index) {
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_native_handle(handle, sub_index);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_native_handle(handle, sub_index);
+#endif
+    jit_tex_unavailable(backend);
+    return 0;
+}
+
+void jit_tex_destroy(void *handle) {
+    if (!handle)
+        return;
+    lock_guard guard(state.lock);
+    JitBackend backend = ((const TextureBase *) handle)->backend;
+#if defined(DRJIT_ENABLE_CUDA)
+    if (jitc_is_cuda(backend))
+        return jitc_cuda_tex_destroy(handle);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if (jitc_is_metal(backend))
+        return jitc_metal_tex_destroy(handle);
+#endif
+    jit_tex_unavailable(backend);
+}
+
+uint32_t jit_var_neg(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_neg(a0);
+}
+
+uint32_t jit_var_not(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_not(a0);
+}
+
+uint32_t jit_var_sqrt(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_sqrt(a0);
+}
+
+uint32_t jit_var_abs(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_abs(a0);
+}
+
+uint32_t jit_var_add(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_add(a0, a1);
+}
+
+uint32_t jit_var_sub(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_sub(a0, a1);
+}
+
+uint32_t jit_var_mul(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_mul(a0, a1);
+}
+
+uint32_t jit_var_div(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_div(a0, a1);
+}
+
+uint32_t jit_var_mod(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_mod(a0, a1);
+}
+
+uint32_t jit_var_mul_hi(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_mul_hi(a0, a1);
+}
+
+uint32_t jit_var_mul_wide(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_mul_wide(a0, a1);
+}
+
+uint32_t jit_var_fma(uint32_t a0, uint32_t a1, uint32_t a2) {
+    lock_guard guard(state.lock);
+    return jitc_var_fma(a0, a1, a2);
+}
+
+uint32_t jit_var_min(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_min(a0, a1);
+}
+
+uint32_t jit_var_max(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_max(a0, a1);
+}
+
+uint32_t jit_var_ceil(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_ceil(a0);
+}
+
+uint32_t jit_var_floor(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_floor(a0);
+}
+
+uint32_t jit_var_round(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_round(a0);
+}
+
+uint32_t jit_var_trunc(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_trunc(a0);
+}
+
+uint32_t jit_var_eq(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_eq(a0, a1);
+}
+
+uint32_t jit_var_neq(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_neq(a0, a1);
+}
+
+uint32_t jit_var_lt(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_lt(a0, a1);
+}
+
+uint32_t jit_var_le(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_le(a0, a1);
+}
+
+uint32_t jit_var_gt(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_gt(a0, a1);
+}
+
+uint32_t jit_var_ge(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_ge(a0, a1);
+}
+
+uint32_t jit_var_select(uint32_t a0, uint32_t a1, uint32_t a2) {
+    lock_guard guard(state.lock);
+    return jitc_var_select(a0, a1, a2);
+}
+
+uint32_t jit_var_popc(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_popc(a0);
+}
+
+uint32_t jit_var_clz(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_clz(a0);
+}
+
+uint32_t jit_var_ctz(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_ctz(a0);
+}
+
+uint32_t jit_var_brev(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_brev(a0);
+}
+
+uint32_t jit_var_and(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_and(a0, a1);
+}
+
+uint32_t jit_var_or(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_or(a0, a1);
+}
+
+uint32_t jit_var_xor(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_xor(a0, a1);
+}
+
+uint32_t jit_var_shl(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_shl(a0, a1);
+}
+
+uint32_t jit_var_shr(uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_var_shr(a0, a1);
+}
+
+uint32_t jit_var_rcp(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_rcp(a0);
+}
+
+uint32_t jit_var_rsqrt(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_rsqrt(a0);
+}
+
+uint32_t jit_var_sin_intrinsic(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_sin_intrinsic(a0);
+}
+
+uint32_t jit_var_cos_intrinsic(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_cos_intrinsic(a0);
+}
+
+uint32_t jit_var_exp2_intrinsic(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_exp2_intrinsic(a0);
+}
+
+uint32_t jit_var_log2_intrinsic(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_log2_intrinsic(a0);
+}
+
+uint32_t jit_var_tanh_intrinsic(uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_var_tanh_intrinsic(a0);
+}
+
+uint32_t jit_var_cast(uint32_t index, VarType target_type,
+                      int reinterpret) {
+    lock_guard guard(state.lock);
+    return jitc_var_cast(index, target_type, reinterpret);
+}
+
+uint32_t jit_var_call_mask(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_var_call_mask(backend);
+}
+
+size_t jit_type_size(VarType type) noexcept {
+    return type_size[(int) type];
+}
+
+const char *jit_type_name(VarType type) noexcept {
+    return type_name[(int) type];
+}
+
+VarInfo jit_set_backend(uint32_t index) noexcept {
+    lock_guard guard(state.lock);
+
+    VarInfo info = jitc_var_info(index);
+    default_backend = info.backend;
+    return info;
+}
+
+VarInfo jit_var_info(uint32_t index) noexcept {
+    lock_guard guard(state.lock);
+
+    return jitc_var_info(index);
+}
+
+uint32_t jit_var_loop_start(const char *name, bool symbolic, size_t n_indices, uint32_t *indices) {
+    lock_guard guard(state.lock);
+    return jitc_var_loop_start(name, symbolic, n_indices, indices);
+}
+
+void jit_var_loop_update_inner_in(uint32_t loop, uint32_t *indices) {
+    lock_guard guard(state.lock);
+    return jitc_var_loop_update_inner_in(loop, indices);
+}
+
+uint32_t jit_var_loop_cond(uint32_t loop, uint32_t active) {
+    lock_guard guard(state.lock);
+    return jitc_var_loop_cond(loop, active);
+}
+
+int jit_var_loop_end(uint32_t loop, uint32_t cond, uint32_t *indices, uint32_t checkpoint) {
+    lock_guard guard(state.lock);
+    return jitc_var_loop_end(loop, cond, indices, checkpoint);
+}
+
+uint32_t jit_var_cond_start(const char *name, bool symbolic, uint32_t cond_t, uint32_t cond_f) {
+    lock_guard guard(state.lock);
+    return jitc_var_cond_start(name, symbolic, cond_t, cond_f);
+}
+
+uint32_t jit_var_cond_append(uint32_t index, const uint32_t *rv, size_t count) {
+    lock_guard guard(state.lock);
+    return jitc_var_cond_append(index, rv, count);
+}
+
+void jit_var_cond_end(uint32_t index, uint32_t *rv_out) {
+    lock_guard guard(state.lock);
+    jitc_var_cond_end(index, rv_out);
+}
+
+void jit_set_source_location(const char *fname, size_t lineno) noexcept {
+    jitc_set_source_location(fname, lineno);
+}
+
+uint64_t jit_var_stash_ref(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_stash_ref(index);
+}
+
+void jit_var_unstash_ref(uint64_t handle) {
+    lock_guard guard(state.lock);
+    return jitc_var_unstash_ref(handle);
+}
+
+void jit_enqueue_host_func(JitBackend backend, void (*callback)(void *),
+                           void *payload) {
+    lock_guard guard(state.lock);
+    jitc_enqueue_host_func(backend, callback, payload);
+}
+
+/// Compress a sparse boolean array into an index array of the active indices
+uint32_t jit_var_compress(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_compress(index);
+}
+
+// Shrink a variable after it has been created
+uint32_t jit_var_shrink(uint32_t index, size_t size) {
+    lock_guard guard(state.lock);
+    return jitc_var_shrink(index, size);
+}
+
+void jit_profile_mark(const char *message) {
+    jitc_profile_mark(message);
+}
+
+void jit_profile_range_push(const char *message) {
+    jitc_profile_range_push(message);
+}
+
+void jit_profile_range_pop() {
+    jitc_profile_range_pop();
+}
+
+size_t llvm_expand_threshold = 1024 * 1024; // 1M entries
+
+void jit_llvm_set_expand_threshold(size_t size) {
+    llvm_expand_threshold = size;
+}
+
+size_t jit_llvm_expand_threshold() noexcept {
+    return llvm_expand_threshold;
+}
+
+uint64_t jit_reduce_identity(VarType vt, ReduceOp op) {
+    lock_guard guard(state.lock);
+    return jitc_reduce_identity(vt, op);
+}
+
+uint32_t jit_var_block_reduce(ReduceOp op, uint32_t index, uint32_t block_size, int symbolic) {
+    lock_guard guard(state.lock);
+    return jitc_var_block_reduce(op, index, block_size, symbolic);
+}
+
+int jit_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
+    lock_guard guard(state.lock);
+    return jitc_can_scatter_reduce(backend, vt, op);
+}
+
+uint32_t jit_var_tile(uint32_t index, uint32_t count) {
+    lock_guard guard(state.lock);
+    return jitc_var_tile(index, count);
+}
+
+uint32_t jit_var_repeat(uint32_t index, uint32_t count, size_t max_size) {
+    lock_guard guard(state.lock);
+    return jitc_var_repeat(index, count, max_size);
+}
+
+uint32_t jit_array_create(JitBackend backend, VarType vt, size_t size,
+                          size_t length) {
+    lock_guard guard(state.lock);
+    return jitc_array_create(backend, vt, size, length);
+}
+
+uint32_t jit_array_init(uint32_t target, uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_array_init(target, index);
+}
+
+uint32_t jit_array_read(uint32_t source, uint32_t offset, uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_array_read(source, offset, mask);
+}
+
+uint32_t jit_array_write(uint32_t target, uint32_t offset, uint32_t value, uint32_t mask) {
+    lock_guard guard(state.lock);
+    return jitc_array_write(target, offset, value, mask);
+}
+
+size_t jit_array_length(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_array_length(index);
+}
+
+uint32_t jit_var_reverse(uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_var_reverse(index);
+}
+
+int jit_leak_warnings() {
+    return (int) state.leak_warnings;
+}
+
+void jit_set_leak_warnings(int value) {
+    state.leak_warnings = (bool) value;
+}
+
+void jit_reorder(uint32_t key, uint32_t num_bits, uint32_t n_values,
+                 uint32_t *values, uint32_t *out) {
+    lock_guard guard(state.lock);
+    return jitc_reorder(key, num_bits, n_values, values, out);
+}
+
+void jit_freeze_start(JitBackend backend, const uint32_t *inputs,
+                      uint32_t n_inputs) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_start(backend, inputs, n_inputs);
+}
+
+Recording *jit_freeze_stop(JitBackend backend, const uint32_t *outputs,
+                           uint32_t n_outputs) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_stop(backend, outputs, n_outputs);
+}
+
+int jit_freeze_pause(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_pause(backend);
+}
+
+int jit_freeze_resume(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_resume(backend);
+}
+
+void jit_freeze_abort(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_abort(backend);
+}
+
+void jit_freeze_replay(Recording *recording, const uint32_t *inputs,
+                       uint32_t *outputs) {
+    lock_guard guard(state.lock);
+    jitc_freeze_replay(recording, inputs, outputs);
+}
+
+int jit_freeze_dry_run(Recording *recording, const uint32_t *inputs) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_dry_run(recording, inputs);
+}
+
+void jit_freeze_discard(JitBackend backend, const char *message) {
+    lock_guard guard(state.lock);
+    jitc_freeze_discard(backend, message);
+}
+
+int jit_freeze_discarded(const Recording *recording) {
+    lock_guard guard(state.lock);
+    return jitc_freeze_discarded(recording);
+}
+
+void jit_freeze_destroy(Recording *recording) {
+    lock_guard guard(state.lock);
+    jitc_freeze_destroy(recording);
+}
+
+void jit_profile_start() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+#  if defined(DRJIT_DYNAMIC_CUDA)
+    if (cuProfilerStart)
+        cuProfilerStart();
+#  else
+    cuProfilerStart();
+#  endif
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if ((state.backends & (1u << (uint32_t) JitBackend::Metal)) &&
+        !state.metal_devices.empty())
+        jitc_metal_profile_start();
+#endif
+}
+
+void jit_profile_stop() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_CUDA)
+#  if defined(DRJIT_DYNAMIC_CUDA)
+    if (cuProfilerStop)
+        cuProfilerStop();
+#  else
+    cuProfilerStop();
+#  endif
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    if ((state.backends & (1u << (uint32_t) JitBackend::Metal)) &&
+        !state.metal_devices.empty())
+        jitc_metal_profile_stop();
+#endif
+}
+
+uint32_t jit_coop_vec_pack(uint32_t n, const uint32_t *in) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_pack(n, in);
+}
+
+void jit_coop_vec_unpack(uint32_t index, uint32_t n, uint32_t *out) {
+    lock_guard guard(state.lock);
+    jitc_coop_vec_unpack(index, n, out);
+}
+
+uint32_t jit_coop_vec_literal(JitBackend backend, VarType type,
+                              const void *value, size_t size, uint32_t length) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_literal(backend, type, value, size, length);
+}
+
+uint32_t jit_coop_vec_load(uint32_t buffer_index, uint32_t offset, uint32_t length) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_load(buffer_index, offset, length);
+}
+
+uint32_t jit_coop_vec_unary_op(JitOp op, uint32_t a0) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_unary_op(op, a0);
+}
+
+uint32_t jit_coop_vec_binary_op(JitOp op, uint32_t a0, uint32_t a1) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_binary_op(op, a0, a1);
+}
+
+uint32_t jit_coop_vec_ternary_op(JitOp op, uint32_t a0, uint32_t a1, uint32_t a2) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_ternary_op(op, a0, a1, a2);
+}
+
+void jit_coop_vec_pack_matrices(uint32_t count,
+                       uint32_t in, const MatrixDescr *in_descr,
+                       uint32_t out, const MatrixDescr *out_descr) {
+    lock_guard guard(state.lock);
+    jitc_coop_vec_pack_matrices(count, in, in_descr, out, out_descr);
+}
+
+MatrixDescr jit_coop_vec_compute_layout(uint32_t index,
+                                        const MatrixDescr *in,
+                                        MatrixLayout layout,
+                                        uint32_t offset) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_compute_layout(index, in, layout, offset);
+}
+
+uint32_t jit_coop_vec_matvec(uint32_t A_index, const MatrixDescr *A_descr,
+                             uint32_t x_index, uint32_t b_index,
+                             const MatrixDescr *b_descr, int transpose) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_matvec(A_index, A_descr, x_index, b_index, b_descr,
+                                transpose);
+}
+
+uint32_t jit_coop_vec_length(uint32_t index) {
+    lock_guard guard(state.lock);
+    const Variable *v = jitc_var(index);
+    if (!v->coop_vec)
+        jitc_raise("jit_coop_vec_length(): r%u is not a cooperative vector!", index);
+    return v->array_length;
+}
+
+uint32_t jit_coop_vec_accum(uint32_t target, uint32_t target_size,
+                            uint32_t offset, uint32_t index) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_accum(target, target_size, offset, index);
+}
+
+uint32_t jit_coop_vec_outer_product_accum(uint32_t target, uint32_t target_size,
+                                          const MatrixDescr *descr, uint32_t a,
+                                          uint32_t b) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_outer_product_accum(target, target_size, descr, a, b);
+}
+
+uint32_t jit_coop_vec_cast(uint32_t index, VarType vt) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_cast(index, vt);
+}
+
+bool jit_coop_vec_supported(JitBackend backend) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_supported(backend);
+}
+
+// ====================================================================
+//                            Event API
+// ====================================================================
+
+JitEvent jit_event_create(JitBackend backend, int enable_timing) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_create(): events cannot be used while recording a frozen function");
+
+    switch (backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            return jitc_cuda_event_create(enable_timing);
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            return jitc_metal_event_create(enable_timing);
+#endif
+
+        case JitBackend::LLVM:
+            return jitc_llvm_event_create(enable_timing);
+
+        default:
+            jitc_raise("jit_event_create(): invalid backend");
+    }
+}
+
+void jit_event_destroy(JitEvent event) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_destroy(): events cannot be used while recording a frozen function");
+
+    EventData* e = (EventData*)event;
+
+    switch (e->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            jitc_cuda_event_destroy(event);
+            break;
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            jitc_metal_event_destroy(event);
+            break;
+#endif
+
+        case JitBackend::LLVM:
+            jitc_llvm_event_destroy(event);
+            break;
+
+        default:
+            jitc_raise("jit_event_destroy(): invalid backend");
+    }
+}
+
+void jit_event_record(JitEvent event) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_record(): events cannot be used while recording a frozen function");
+
+    EventData* e = (EventData*)event;
+
+    switch (e->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            jitc_cuda_event_record(event);
+            break;
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            jitc_metal_event_record(event);
+            break;
+#endif
+
+        case JitBackend::LLVM:
+            jitc_llvm_event_record(event);
+            break;
+        default:
+            jitc_raise("jit_event_record(): invalid backend");
+    }
+}
+
+int jit_event_query(JitEvent event) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_query(): events cannot be used while recording a frozen function");
+
+    EventData* e = (EventData*)event;
+
+    switch (e->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            return jitc_cuda_event_query(event);
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            return jitc_metal_event_query(event);
+#endif
+
+        case JitBackend::LLVM:
+            return jitc_llvm_event_query(event);
+
+        default:
+            jitc_raise("jit_event_query(): invalid backend");
+    }
+}
+
+void jit_event_wait(JitEvent event) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_wait(): events cannot be used while recording a frozen function");
+
+    EventData* e = (EventData*)event;
+
+    switch (e->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            jitc_cuda_event_wait(event);
+            break;
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            jitc_metal_event_wait(event);
+            break;
+#endif
+
+        case JitBackend::LLVM:
+            jitc_llvm_event_wait(event);
+            break;
+
+        default:
+            jitc_raise("jit_event_wait(): invalid backend");
+    }
+}
+
+float jit_event_elapsed_time(JitEvent start, JitEvent end) {
+    lock_guard guard(state.lock);
+
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_elapsed_time(): events cannot be used while recording a frozen function");
+
+    EventData* s = (EventData*)start;
+    EventData* e = (EventData*)end;
+
+    if (s->backend != e->backend)
+        jitc_raise("jit_event_elapsed_time(): events must be from the same backend");
+
+    switch (s->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            return jitc_cuda_event_elapsed_time(start, end);
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            jitc_raise("jit_event_elapsed_time(): event timing is not "
+                       "supported on the Metal backend");
+#endif
+
+        case JitBackend::LLVM:
+            return jitc_llvm_event_elapsed_time(start, end);
+
+        default:
+            jitc_raise("jit_event_elapsed_time(): invalid backend");
+    }
+}
+
+void* jit_event_handle(JitEvent event) {
+    // Not necessary to acquire Dr.Jit-Core mutex for this function
+    if (jit_flag(JitFlag::FreezingScope))
+        jitc_raise("jit_event_handle(): events cannot be used while recording a frozen function");
+
+    EventData* e = (EventData*)event;
+
+    switch (e->backend) {
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA:
+            return (void*)e->cuda_event;
+#endif
+
+#if defined(DRJIT_ENABLE_METAL)
+        case JitBackend::Metal:
+            return e->metal_event;
+#endif
+
+        case JitBackend::LLVM:
+            return (void*)e->llvm_task;
+
+        default:
+            jitc_raise("jit_event_handle(): invalid backend");
+    }
+}
